@@ -51,31 +51,15 @@ claudego -- claude --model opus "Summarize this document for me"
 You can install `claudego` with the following command. The script will install the binary to `$HOME/.local/bin`.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/claudego/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/adrien2121/claudego/main/install.sh | sh
 ```
 
 Please ensure `$HOME/.local/bin` is in your `PATH` environment variable.
 
 ### Windows
 
-**Recommended: Package Manager**
-
-Install `claudego` using Winget or Scoop for automatic PATH management.
+You can install `claudego` with this one-line command in PowerShell. This will download the latest release and place it in a local directory.
 
 ```powershell
-# Winget (built into Windows)
-winget install YOUR_USERNAME.claudego
-
-# Scoop
-scoop install claudego
+iwr https://raw.githubusercontent.com/adrienadam/claudego/main/install.ps1 -useb | iex
 ```
-*(Note: You may need to create and submit manifests to these package managers first.)*
-
-**Alternative: PowerShell Script**
-
-If you don't use a package manager, you can run this one-line command in PowerShell.
-
-```powershell
-iwr https://raw.githubusercontent.com/YOUR_USERNAME/claudego/main/install.ps1 -useb | iex
-```
-*(Note: You may need to set your execution policy with `Set-ExecutionPolicy RemoteSigned -Scope CurrentUser` first.)*

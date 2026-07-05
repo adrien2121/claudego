@@ -2,7 +2,7 @@
 set -e
 
 # The GitHub repository in "username/repo" format
-REPO="YOUR_USERNAME/claudego"
+REPO="adrien2121/claudego"
 
 # The name of the binary
 BINARY="claudego"

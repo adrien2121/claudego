@@ -4,7 +4,7 @@
 $ErrorActionPreference = "Stop"
 
 # GitHub repository
-$Repo = "YOUR_USERNAME/claudego"
+$Repo = "adrien2121/claudego"
 $BinaryName = "claudego"
 
 # Installation directory
