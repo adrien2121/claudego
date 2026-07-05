@@ -4,9 +4,10 @@ set -e
 
 REPO="adrien2121/claudego"
 BIN_NAME="claudego"
+LOGS_BIN_NAME="claudego-logs"
 INSTALL_DIR="$HOME/.local/bin"
 
-echo "Installing $BIN_NAME..."
+echo "Installing $BIN_NAME and $LOGS_BIN_NAME..."
 
 # Create install directory if it doesn't exist
 mkdir -p "$INSTALL_DIR"
@@ -18,7 +19,7 @@ if command -v cargo >/dev/null 2>&1; then
     
     # Ensure binary is in the requested location (cargo install --root puts it in bin/)
     if [ -f "$HOME/.local/bin/$BIN_NAME" ]; then
-        echo "$BIN_NAME installed successfully to $HOME/.local/bin!"
+        echo "$BIN_NAME and $LOGS_BIN_NAME installed successfully to $HOME/.local/bin!"
         echo "Make sure $HOME/.local/bin is in your PATH."
         exit 0
     fi

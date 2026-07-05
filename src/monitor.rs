@@ -24,7 +24,7 @@ pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
         let detected_limit = {
             let mut app_state = state.lock().unwrap();
 
-            if app_state.show_logs && !app_state.is_sleeping {
+            if !app_state.is_sleeping {
                 log_to_file("[Startup] Performing initial rate limit check...");
             }
 

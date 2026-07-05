@@ -2,15 +2,16 @@ $ErrorActionPreference = "Stop"
 
 $Repo = "adrien2121/claudego"
 $BinName = "claudego"
+$LogsBinName = "claudego-logs"
 
-Write-Host "Installing $BinName..."
+Write-Host "Installing $BinName and $LogsBinName..."
 
 # Check if cargo is installed
 if (Get-Command cargo -ErrorAction SilentlyContinue) {
     Write-Host "Cargo detected. Building and installing via cargo..."
     cargo install --git "https://github.com/$Repo.git"
     
-    Write-Host "$BinName installed successfully!"
+    Write-Host "$BinName and $LogsBinName installed successfully!"
     Write-Host "Make sure your cargo bin directory (usually ~/.cargo/bin) is in your PATH."
     exit 0
 }
