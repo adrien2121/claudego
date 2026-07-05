@@ -66,7 +66,7 @@ Usage:
 
 Options:
   -h, --help       Show this help
-  -l, --show-logs  Show live log instructions and write diagnostics to /tmp/claudego.log
+  -l, --show-logs  Show live log instructions and write diagnostics to a system temp directory
 
 Examples:
   claudego

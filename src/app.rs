@@ -38,7 +38,7 @@ fn wait_after_showing_log_instructions() {
     logging::reset_log_file();
     logging::log_to_file("System initialized successfully. Starting passive monitoring.");
 
-    let log_path = std::env::temp_dir().join("claudego.log");
+    let log_path = logging::log_path();
     println!("------------------------------------------------------------");
     println!("[System] Streaming live logs to {}", log_path.display());
     println!("[System] To view real-time logs, run this in a separate window:");

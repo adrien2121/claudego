@@ -42,8 +42,7 @@ claudego -- caffeinate -s headroom wrap claude
 ### Options
 
 *   `-l`, `--show-logs`: Enables diagnostic logging. When this flag is active, `claudego` will print instructions on how to view live logs and write detailed operational information to a log file.
-    *   **macOS / Linux**: `/tmp/claudego.log`
-    *   **Windows**: `%TEMP%\claudego.log`
+    *   **macOS / Linux / Windows**: Uses the system temporary directory (`$TMPDIR` or `%TEMP%`, e.g., `/tmp/claudego.log` or `/var/folders/.../T/claudego.log`)
 
 ## Installation
 
