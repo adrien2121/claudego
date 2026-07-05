@@ -1,0 +1,13 @@
+{
+    "version": "0.1.0",
+    "description": "Run Claude in a PTY and auto-continue after rate-limit reset.",
+    "homepage": "https://github.com/YOUR_USERNAME/claudego",
+    "license": "MIT",
+    "architecture": {
+        "64bit": {
+            "url": "https://github.com/YOUR_USERNAME/claudego/releases/download/v0.1.0/claudego-v0.1.0-x86_64-pc-windows-msvc.zip",
+            "hash": "SHA256_HASH_OF_THE_ZIP_FILE"
+        }
+    },
+    "bin": "claudego.exe"
+}
