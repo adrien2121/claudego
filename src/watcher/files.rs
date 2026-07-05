@@ -3,9 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-pub(crate) fn claude_projects_root() -> Option<PathBuf> {
-    let home = std::env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".claude/projects"))
+pub fn claude_projects_root() -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    Some(home.join(".claude/projects"))
 }
 
 pub(crate) fn recent_session_logs(

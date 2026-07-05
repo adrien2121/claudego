@@ -9,7 +9,7 @@ use std::path::Path;
 
 const CHUNK_SIZE: u64 = 65536;
 
-pub(crate) fn scan_session_log(
+pub fn scan_session_log(
     path: &Path,
     state: &mut AppState,
     should_scan: bool,
@@ -37,6 +37,15 @@ pub(crate) fn scan_session_log(
 }
 
 fn scan_file_from_end(file: &mut File, size: u64) -> Option<(DateTime<Local>, String)> {
+    if size > 0 {
+        let mut last_byte = [0u8; 1];
+        if file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last_byte).is_ok() {
+            if last_byte[0] != b'\n' {
+                return None; // File is mid-write, ignore it for now
+            }
+        }
+    }
+
     let mut offset = size;
     let mut leftover = Vec::new();
 

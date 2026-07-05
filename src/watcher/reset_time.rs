@@ -26,8 +26,13 @@ pub(crate) fn parse_reset_time(
     let target_time = if let (Some(month_cap), Some(day_cap)) = (caps.get(1), caps.get(2)) {
         let month = parse_month(month_cap.as_str())?;
         let day = day_cap.as_str().parse::<u32>().ok()?;
-        local_datetime(log_time.year(), month, day, mil_hour, minute)?
-            + chrono::Duration::seconds(5)
+        let mut target = local_datetime(log_time.year(), month, day, mil_hour, minute)?
+            + chrono::Duration::seconds(5);
+        if target < log_time {
+            target = local_datetime(log_time.year() + 1, month, day, mil_hour, minute)?
+                + chrono::Duration::seconds(5);
+        }
+        target
     } else {
         let mut target = local_datetime(
             log_time.year(),
@@ -70,7 +75,15 @@ fn local_datetime(
 
     match Local.from_local_datetime(&datetime) {
         chrono::offset::LocalResult::Single(time) => Some(time),
-        _ => None,
+        chrono::offset::LocalResult::Ambiguous(time1, _) => Some(time1),
+        chrono::offset::LocalResult::None => {
+            let shifted = datetime + chrono::Duration::hours(1);
+            match Local.from_local_datetime(&shifted) {
+                chrono::offset::LocalResult::Single(time) => Some(time),
+                chrono::offset::LocalResult::Ambiguous(time1, _) => Some(time1),
+                _ => None,
+            }
+        }
     }
 }
 

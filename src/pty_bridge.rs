@@ -61,7 +61,9 @@ pub fn spawn_input_writer(writer: SharedPtyWriter) {
                 break;
             }
 
-            let mut pty_writer = writer.lock().unwrap();
+            let mut pty_writer = writer
+                .lock()
+                .expect("PTY writer lock was poisoned");
             if pty_writer.write_all(&buf[..n]).is_err() {
                 break;
             }
@@ -71,6 +73,25 @@ pub fn spawn_input_writer(writer: SharedPtyWriter) {
 }
 
 pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: TerminalSize) {
+    #[cfg(unix)]
+    thread::spawn(move || {
+        use signal_hook::consts::SIGWINCH;
+        use signal_hook::iterator::Signals;
+
+        let mut current_size = initial_size;
+        if let Ok(mut signals) = Signals::new(&[SIGWINCH]) {
+            for _ in signals.forever() {
+                if let Ok(new_size) = crossterm::terminal::size() {
+                    if new_size != current_size {
+                        current_size = new_size;
+                        let _ = master.resize(to_pty_size(new_size));
+                    }
+                }
+            }
+        }
+    });
+
+    #[cfg(not(unix))]
     thread::spawn(move || {
         let mut current_size = initial_size;
         loop {
@@ -89,10 +110,6 @@ fn build_command(command: CommandSpec) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(command.program);
     if !command.args.is_empty() {
         cmd.args(command.args);
-    }
-
-    for (key, val) in std::env::vars() {
-        cmd.env(key, val);
     }
 
     if let Ok(current_dir) = std::env::current_dir() {

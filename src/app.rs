@@ -38,10 +38,11 @@ fn wait_after_showing_log_instructions() {
     logging::reset_log_file();
     logging::log_to_file("System initialized successfully. Starting passive monitoring.");
 
+    let log_path = std::env::temp_dir().join("claudego.log");
     println!("------------------------------------------------------------");
-    println!("[System] Streaming live logs to /tmp/claudego.log");
+    println!("[System] Streaming live logs to {}", log_path.display());
     println!("[System] To view real-time logs, run this in a separate window:");
-    println!("         tail -f /tmp/claudego.log");
+    println!("         tail -f {}", log_path.display());
     println!("------------------------------------------------------------");
     print!("Press ENTER to boot Claude Code...");
 

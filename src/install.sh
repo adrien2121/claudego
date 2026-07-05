@@ -12,16 +12,26 @@ BINARY="claudego"
 echo "Preparing to install $BINARY..."
 
 # Identify OS and architecture
-if [[ "$(uname)" == "Darwin" ]]; then
+os_name=$(uname)
+machine_arch=$(uname -m)
+
+if [[ "$os_name" == "Darwin" ]]; then
   os="apple-darwin"
-  if [[ "$(uname -m)" == "arm64" ]]; then
+  if [[ "$machine_arch" == "arm64" ]]; then
+    arch="aarch64"
+  else
+    arch="x86_64"
+  fi
+elif [[ "$os_name" == "Linux" ]]; then
+  os="unknown-linux-gnu"
+  if [[ "$machine_arch" == "aarch64" ]]; then
     arch="aarch64"
   else
     arch="x86_64"
   fi
 else
-  os="unknown-linux-gnu"
-  arch="x86_64" # Assuming x86_64 for Linux for simplicity
+  echo "Error: Unsupported OS '$os_name'. Only macOS and Linux are supported by this script."
+  exit 1
 fi
 
 # Fetch the latest release version from GitHub API

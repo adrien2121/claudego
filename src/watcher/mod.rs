@@ -3,9 +3,9 @@ use crate::models::AppState;
 use chrono::{DateTime, Local};
 use std::time::{Duration, SystemTime};
 
-mod files;
+pub mod files;
 mod reset_time;
-mod scan;
+pub mod scan;
 
 pub fn check_native_session_limit(state: &mut AppState) -> Option<(DateTime<Local>, String)> {
     let projects_root = files::claude_projects_root()?;
