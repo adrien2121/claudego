@@ -22,11 +22,11 @@ You've reached your usage limit. Please try again in 5 hours.
 
 ## Usage
 
-`claudego` can be run directly to launch `claude`, or it can be used to wrap any custom command and its arguments.
+`claudego` is designed for an intuitive command-line experience, removing the need for boilerplate.
 
-**Default Behavior (run `claude`):**
+**Basic Usage:**
 
-Running `claudego` by itself is the simplest way to start a monitored `claude` session.
+To start a simple, monitored `claude` session, just run the command by itself.
 ```bash
 claudego
 ```
@@ -34,6 +34,9 @@ claudego
 **Run `claude` with specific arguments:**
 ```bash
 claudego -- claude --model opus "Summarize this document for me"
+```
+```bash
+claudego -- caffeinate -s headroom wrap claude
 ```
 
 ### Options
