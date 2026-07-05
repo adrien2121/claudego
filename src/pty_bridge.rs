@@ -4,7 +4,6 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 pub type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
