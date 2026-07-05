@@ -64,5 +64,5 @@ Please ensure `$HOME/.local/bin` is in your `PATH` environment variable.
 You can install `claudego` with this one-line command in PowerShell. This will download the latest release and place it in a local directory.
 
 ```powershell
-iwr https://raw.githubusercontent.com/adrienadam/claudego/main/install.ps1 -useb | iex
+iwr https://raw.githubusercontent.com/adrien2121/claudego/main/install.ps1 -useb | iex
 ```

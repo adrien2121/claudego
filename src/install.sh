@@ -49,3 +49,34 @@ rm "${BINARY}.tar.gz"
 echo ""
 echo "$BINARY has been installed to $install_dir/$BINARY"
 echo "Please ensure '$install_dir' is in your PATH."
+
+# Check if install_dir is in PATH
+case ":$PATH:" in
+  *":$install_dir:"*)
+    # Already in PATH
+    ;;
+  *)
+    echo ""
+    echo "ACTION REQUIRED:"
+    echo "To use the '$BINARY' command, please add the installation directory to your PATH."
+    echo "You can do this by adding the following line to your shell's configuration file:"
+    echo ""
+
+    shell_name=$(basename "$SHELL")
+    config_file=""
+    [ "$shell_name" = "zsh" ] && config_file="$HOME/.zshrc"
+    [ "$shell_name" = "bash" ] && config_file="$HOME/.bashrc"
+
+    if [ -n "$config_file" ]; then
+        path_line="export PATH=\"\$HOME/.local/bin:\$PATH\""
+        echo "  $path_line"
+        echo ""
+        read -p "Would you like to add this to '$config_file' automatically? (y/N) " -n 1 -r
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo "$path_line" >> "$config_file"
+            echo "Successfully updated '$config_file'. Please restart your terminal to apply the changes."
+        fi
+    fi
+    ;;
+esac
