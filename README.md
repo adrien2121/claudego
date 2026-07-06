@@ -23,7 +23,7 @@ The intelligent polling mechanism is designed to be efficient: it checks infrequ
 
 4.  **Asynchronous Waiting:** Once a rate limit is detected, `claudego` calculates the exact reset time. It then enters an efficient, asynchronous wait state. The polling interval is adaptive: it starts long and shortens as the reset time approaches to minimize resource usage.
 
-5.  **Automatic Resumption:** When the cooldown period ends, `claudego` injects the `continue\n` command into the PTY, which resumes your `claude` session right where it left off.
+5.  **Automatic Resumption:** When the cooldown period ends, `claudego` injects the `continue\n` command into the PTY of the specific `claude` process it is managing. This is equivalent to you typing `continue` in that terminal window. The command will apply to whichever conversation is currently active within your `claude` session, even if you've used commands like `/resume` to switch contexts.
 
 
 When you hit a rate limit, you will see messages like this in the log file:
