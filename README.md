@@ -13,15 +13,15 @@ The intelligent polling mechanism is designed to be efficient: it checks infrequ
 
 ## How it Works
 
-`claudego` is built in Rust and leverages several key components to achieve its "fire-and-forget" functionality:
+`claudego` is built in Rust.
 
 1.  **Pseudo-Terminal (PTY):** It spawns the `claude` command within a PTY. This allows `claudego` to act as a terminal, capturing all output from `claude` and enabling it to send input (like the `continue` command) programmatically.
 
-2.  **Log File Monitoring:** It asynchronously watches Claude's session log files (typically located in a system-specific temp directory). When a file is modified, `claudego` reads it to check for rate-limit messages.
+2.  **Log File Monitoring:** It asynchronously watches Claude's session log files. When a file is modified, `claudego` reads it to check for rate-limit messages.
 
 3.  **Rate-Limit Detection:** Using regular expressions, it parses the log files for patterns like "Please try again in X hours/minutes." and extracts the cooldown duration.
 
-4.  **Asynchronous Waiting:** Once a rate limit is detected, `claudego` calculates the exact reset time. It then enters an efficient, asynchronous wait state using `tokio`. The polling interval is adaptive: it starts long and shortens as the reset time approaches to minimize resource usage.
+4.  **Asynchronous Waiting:** Once a rate limit is detected, `claudego` calculates the exact reset time. It then enters an efficient, asynchronous wait state. The polling interval is adaptive: it starts long and shortens as the reset time approaches to minimize resource usage.
 
 5.  **Automatic Resumption:** When the cooldown period ends, `claudego` injects the `continue\n` command into the PTY, which resumes your `claude` session right where it left off.
 
