@@ -7,13 +7,26 @@ A smart wrapper for the `claude` CLI that automatically continues your session a
 
 `claudego` is a "fire-and-forget" wrapper for the `claude` CLI. It runs your command as usual, but works silently in the background to monitor for rate-limit errors across all of Claude's session files on your system.
 
-When it detects a rate limit (e.g., "Please try again in 5 hours."), it doesn't interrupt you. It calculates the reset time and waits. Once the cooldown is over, it automatically injects a `continue` command into your session, letting you resume your work seamlessly.
+When it detects a rate limit (e.g., "Please try again in 5 hours."), it calculates the reset time and waits. Once the cooldown is over, it automatically injects a `continue` command into your session, letting you resume your work seamlessly.
 
 The intelligent polling mechanism is designed to be efficient: it checks infrequently when the reset is hours away and more often as the time gets closer. For a detailed view of this process, you can use the `--show-logs` flag.
 
-## How it Works (with Logging)
+## How it Works
 
-While `claudego` operates silently by default, enabling logs with `-l` or `--show-logs` reveals what's happening behind the scenes. When you hit a rate limit, you will see messages like this in the log file:
+`claudego` is built in Rust and leverages several key components to achieve its "fire-and-forget" functionality:
+
+1.  **Pseudo-Terminal (PTY):** It spawns the `claude` command within a PTY. This allows `claudego` to act as a terminal, capturing all output from `claude` and enabling it to send input (like the `continue` command) programmatically.
+
+2.  **Log File Monitoring:** It asynchronously watches Claude's session log files (typically located in a system-specific temp directory). When a file is modified, `claudego` reads it to check for rate-limit messages.
+
+3.  **Rate-Limit Detection:** Using regular expressions, it parses the log files for patterns like "Please try again in X hours/minutes." and extracts the cooldown duration.
+
+4.  **Asynchronous Waiting:** Once a rate limit is detected, `claudego` calculates the exact reset time. It then enters an efficient, asynchronous wait state using `tokio`. The polling interval is adaptive: it starts long and shortens as the reset time approaches to minimize resource usage.
+
+5.  **Automatic Resumption:** When the cooldown period ends, `claudego` injects the `continue\n` command into the PTY, which resumes your `claude` session right where it left off.
+
+
+When you hit a rate limit, you will see messages like this in the log file:
 
 ```
 You've reached your usage limit. Please try again in 5 hours.
@@ -21,8 +34,6 @@ You've reached your usage limit. Please try again in 5 hours.
 ```
 
 ## Usage
-
-`claudego` is designed for an intuitive command-line experience, removing the need for boilerplate.
 
 **Basic Usage:**
 
@@ -40,12 +51,9 @@ claudego -- caffeinate -s headroom wrap claude
 ```
 
 ### Viewing Logs (`claudego-logs`)
-If you start `claudego` with the `--show-logs` flag, a second terminal will open to display logs.
+If you run `claudego --show-logs`, a second terminal will open to display logs.
 
-The installation also includes a companion `claudego-logs` command. 
-```bash
-claudego-logs
-```
+The installation also includes a companion `claudego-logs` command. It can be used in a separate terminal while `claudego` is running.
 This will automatically find the correct log file for your system and tail it in real-time. Press `Ctrl+C` to exit.
 
 ## Installation
