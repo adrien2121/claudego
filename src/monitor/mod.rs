@@ -113,16 +113,19 @@ fn handle_locked_wait(
         // Timeout means the lockout expired. Loop will re-evaluate.
         Err(RecvTimeoutError::Timeout) => WaitOutcome::ShouldContinue,
         // The watcher channel disconnected. Attempt to recover.
-        Err(RecvTimeoutError::Disconnected) => {
-            log_to_file("[Watcher] Disconnected. Attempting recovery…");
-            match lifecycle::create_watcher() {
-                Some(h) => {
-                    *handle = h;
-                    WaitOutcome::ShouldContinue
-                }
-                None => WaitOutcome::WatcherDied,
-            }
+        Err(RecvTimeoutError::Disconnected) => recover_watcher(handle),
+    }
+}
+
+/// Attempts to recover a disconnected file system watcher.
+fn recover_watcher(handle: &mut WatcherHandle) -> WaitOutcome {
+    log_to_file("[Watcher] Disconnected. Attempting recovery…");
+    match lifecycle::create_watcher() {
+        Some(new_handle) => {
+            *handle = new_handle;
+            WaitOutcome::ShouldContinue
         }
+        None => WaitOutcome::WatcherDied,
     }
 }
 
@@ -133,16 +136,6 @@ fn handle_unlocked_wait(handle: &mut WatcherHandle) -> WaitOutcome {
         Ok(Ok(ev)) => WaitOutcome::Event(ev),
         // A `notify` error occurred, but the channel is fine. Continue.
         Ok(Err(_)) => WaitOutcome::ShouldContinue,
-        Err(_) => {
-            // The watcher channel disconnected. Attempt to recover.
-            log_to_file("[Watcher] Disconnected. Attempting recovery…");
-            match lifecycle::create_watcher() {
-                Some(h) => {
-                    *handle = h;
-                    WaitOutcome::ShouldContinue
-                }
-                None => WaitOutcome::WatcherDied,
-            }
-        }
+        Err(_) => recover_watcher(handle),
     }
 }
