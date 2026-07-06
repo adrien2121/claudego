@@ -4,7 +4,8 @@ use crate::pty_bridge::SharedPtyWriter;
 use crate::watcher::files as watcher_files;
 use chrono::{DateTime, Local};
 use std::collections::HashSet;
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
@@ -52,6 +53,16 @@ pub(super) fn scan_and_update_state(
     state: &SharedAppState,
     next_log_time: &mut Instant,
 ) {
+    // Log which files are being scanned.
+    let path_names: Vec<_> = paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect();
+    log_to_file(&format!(
+        "[File Event] Triggering scan. Changed files: {}",
+        path_names.join(", ")
+    ));
+
     for path in paths {
         let old_size = state
             .lock()
@@ -60,6 +71,36 @@ pub(super) fn scan_and_update_state(
             .get(&path)
             .copied()
             .unwrap_or(0);
+
+        let mut new_content = String::new();
+        if let Ok(mut file) = File::open(&path) {
+            if file.seek(SeekFrom::Start(old_size as u64)).is_ok() {
+                let _ = file.read_to_string(&mut new_content);
+            }
+        }
+
+        if !new_content.trim().is_empty() {
+            const MAX_LINES_TO_LOG: usize = 5;
+            let lines: Vec<_> = new_content.lines().collect();
+            let total_lines = lines.len();
+
+            let mut preview = lines
+                .iter()
+                .take(MAX_LINES_TO_LOG)
+                .map(|line| format!("    > {}", line.trim_end()))
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            if total_lines > MAX_LINES_TO_LOG {
+                preview.push_str(&format!("\n    ... (and {} more lines)", total_lines - MAX_LINES_TO_LOG));
+            }
+
+            log_to_file(&format!(
+                "[File Content] New data in {}:\n{}",
+                path.display(),
+                preview
+            ));
+        }
 
         let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, old_size);
         let file_grew = new_size > old_size;
