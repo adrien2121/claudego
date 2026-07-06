@@ -20,7 +20,7 @@ pub fn run() -> Result<()> {
     logging::reset_log_file();
     logging::log_to_file("System initialized successfully. Starting passive monitoring.");
 
-    let state = Arc::new(Mutex::new(AppState::new(args.show_logs)));
+    let state = Arc::new(Mutex::new(AppState::new()));
 
     if args.show_logs {
         open_logs_terminal();

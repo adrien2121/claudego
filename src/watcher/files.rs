@@ -1,13 +1,14 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
+/// Returns the path to the root directory where Claude projects are stored.
 pub fn claude_projects_root() -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     Some(home.join(".claude/projects"))
 }
 
+/// Finds all `.jsonl` session log files modified after a given time.
 pub(crate) fn recent_session_logs(
     projects_root: &Path,
     modified_after: SystemTime,
@@ -15,11 +16,13 @@ pub(crate) fn recent_session_logs(
     let mut files = Vec::new();
 
     if let Ok(project_entries) = fs::read_dir(projects_root) {
+        // Iterate through each project directory inside `.claude/projects`.
         for project_entry in project_entries.flatten() {
             if !project_entry.path().is_dir() {
                 continue;
             }
 
+            // Collect recent log files from the individual project directory.
             collect_recent_jsonl_files(project_entry.path(), modified_after, &mut files);
         }
     }
@@ -27,20 +30,7 @@ pub(crate) fn recent_session_logs(
     files
 }
 
-pub(crate) fn any_file_changed(
-    files: &[(PathBuf, SystemTime)],
-    file_size_cache: &HashMap<PathBuf, u64>,
-) -> bool {
-    files.iter().any(|(path, _)| {
-        fs::metadata(path)
-            .map(|metadata| match file_size_cache.get(path) {
-                Some(cached_size) => *cached_size != metadata.len(),
-                None => true,
-            })
-            .unwrap_or(false)
-    })
-}
-
+/// Helper to collect recent `.jsonl` files from a single project directory.
 fn collect_recent_jsonl_files(
     project_path: PathBuf,
     modified_after: SystemTime,
@@ -52,12 +42,14 @@ fn collect_recent_jsonl_files(
                 continue;
             };
 
+            // We only care about `.jsonl` files.
             if !metadata.is_file()
                 || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl")
             {
                 continue;
             }
 
+            // Check if the file was modified recently enough to be included.
             if let Ok(modified_time) = metadata.modified() {
                 if modified_time > modified_after {
                     files.push((entry.path(), modified_time));
