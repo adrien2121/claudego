@@ -16,6 +16,10 @@ pub(super) fn initial_scan(state: &SharedAppState) {
         .unwrap_or_default();
     let mut latest_limit: Option<(DateTime<Local>, String)> = None;
 
+    if !initial_files.is_empty() {
+        log_to_file(&format!("[Startup] Scanning {} initial session file(s).", initial_files.len()));
+    }
+
     for (path, _) in initial_files {
         // Scan file (I/O, no lock). old_size is 0 to ensure a full check.
         let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, 0);
@@ -86,10 +90,10 @@ pub(super) fn check_and_handle_expiry(
 
     match current_target {
         Some(t) if Local::now() >= t => {
-            log_to_file("[Trigger] Reset time reached. Injecting 'continue\\n'…");
+            log_to_file("[Trigger] Reset time reached. Injecting 'continue' command…");
             {
                 let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = w.write_all(b"continue\n");
+                let _ = w.write_all(b"continue\r");
                 let _ = w.flush();
             }
             {

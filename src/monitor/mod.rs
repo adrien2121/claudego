@@ -62,6 +62,14 @@ pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
                 WaitOutcome::Event(first) => {
                     let paths = events::debounce_events(first, &handle.rx);
                     if !paths.is_empty() {
+                        let path_names: Vec<_> = paths
+                            .iter()
+                            .map(|p| p.file_name().and_then(|s| s.to_str()).unwrap_or("..."))
+                            .collect();
+                        log_to_file(&format!(
+                            "[File Event] Triggering scan. Changed files: {}",
+                            path_names.join(", ")
+                        ));
                         processing::scan_and_update_state(paths, &state, &mut next_log_time);
                     }
                 }
