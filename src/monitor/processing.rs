@@ -22,7 +22,14 @@ pub(super) fn initial_scan(state: &SharedAppState) {
     }
 
     for (path, _) in initial_files {
-        let (limit_opt, _) = scan_file(&path, 0, state);
+        // Perform the scan directly and then update the state in a single lock.
+        let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, 0);
+        state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .file_size_cache
+            .insert(path.clone(), new_size);
+
         if let Some((target, _)) = &limit_opt {
             if latest_limit.as_ref().map_or(true, |(t, _)| target > t) {
                 latest_limit = limit_opt;
@@ -58,35 +65,40 @@ pub(super) fn scan_and_update_state(
     ));
 
     for path in paths {
-        let old_size = state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .file_size_cache
-            .get(&path)
-            .copied()
-            .unwrap_or(0);
+        // --- Lock 1: Read old size ---
+        let old_size = {
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .file_size_cache
+                .get(&path)
+                .copied()
+                .unwrap_or(0)
+        };
 
+        // --- Perform all I/O and scanning without holding a lock ---
+        // This is inefficient as the file is read twice: once here for logging,
+        // and once inside `scan_session_log`. A future refactor could combine these.
         let mut new_content = String::new();
         if let Ok(mut file) = File::open(&path) {
-            if file.seek(SeekFrom::Start(old_size as u64)).is_ok() {
+            if file.seek(SeekFrom::Start(old_size)).is_ok() {
                 let _ = file.read_to_string(&mut new_content);
             }
         }
+        let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, old_size);
 
+        // --- Log content if any was found ---
         if !new_content.trim().is_empty() {
             let preview = crate::monitor::formatters::format_file_content_preview(&new_content);
-
-            log_to_file(&format!(
-                "[File Content] New data in {}:\n{}",
-                path.display(),
-                preview
-            ));
+            log_to_file(&format!("[File Content] New data in {}:\n{}", path.display(), preview));
         }
 
-        let (limit_opt, new_size) = scan_file(&path, old_size, state);
+        // --- Lock 2: Update state with all results from the scan ---
+        let mut app = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        app.file_size_cache.insert(path, new_size);
         let file_grew = new_size > old_size;
-
-        let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((target_time, time_str)) = limit_opt {
             log_to_file(&format!("[LOCKOUT DETECTED] Rate limit hit! Target: {}", time_str));
             app.is_sleeping = true;
@@ -133,19 +145,4 @@ pub(super) fn check_and_handle_expiry(
         }
         None => false,
     }
-}
-
-/// Scans a single file, updates its size in the cache, and returns the scan results.
-fn scan_file(
-    path: &PathBuf,
-    old_size: u64,
-    state: &SharedAppState,
-) -> (Option<(DateTime<Local>, String)>, u64) {
-    let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(path, old_size);
-    state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .file_size_cache
-        .insert(path.clone(), new_size);
-    (limit_opt, new_size)
 }
