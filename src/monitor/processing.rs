@@ -22,21 +22,15 @@ pub(super) fn initial_scan(state: &SharedAppState) {
     }
 
     for (path, _) in initial_files {
-        // Scan file (I/O, no lock). old_size is 0 to ensure a full check.
-        let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, 0);
-
-        // Update state with file size (brief lock)
-        state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .file_size_cache
-            .insert(path.clone(), new_size);
-
+        let (limit_opt, _) = scan_file(&path, 0, state);
         if let Some((target, _)) = &limit_opt {
             if latest_limit.as_ref().map_or(true, |(t, _)| target > t) {
                 latest_limit = limit_opt;
             }
         }
+
+        // Add a blank line for readability between file scans during startup.
+        log_to_file("");
     }
 
     if let Some((target_time, time_str)) = latest_limit {
@@ -59,8 +53,8 @@ pub(super) fn scan_and_update_state(
         .map(|p| p.display().to_string())
         .collect();
     log_to_file(&format!(
-        "[File Event] Triggering scan. Changed files: {}",
-        path_names.join(", ")
+        "[File Event] Triggering scan. Changed files:\n{}",
+        path_names.join("\n")
     ));
 
     for path in paths {
@@ -80,20 +74,7 @@ pub(super) fn scan_and_update_state(
         }
 
         if !new_content.trim().is_empty() {
-            const MAX_LINES_TO_LOG: usize = 5;
-            let lines: Vec<_> = new_content.lines().collect();
-            let total_lines = lines.len();
-
-            let mut preview = lines
-                .iter()
-                .take(MAX_LINES_TO_LOG)
-                .map(|line| format!("    > {}", line.trim_end()))
-                .collect::<Vec<_>>()
-                .join("\n");
-
-            if total_lines > MAX_LINES_TO_LOG {
-                preview.push_str(&format!("\n    ... (and {} more lines)", total_lines - MAX_LINES_TO_LOG));
-            }
+            let preview = crate::monitor::formatters::format_file_content_preview(&new_content);
 
             log_to_file(&format!(
                 "[File Content] New data in {}:\n{}",
@@ -102,12 +83,10 @@ pub(super) fn scan_and_update_state(
             ));
         }
 
-        let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, old_size);
+        let (limit_opt, new_size) = scan_file(&path, old_size, state);
         let file_grew = new_size > old_size;
 
         let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
-        app.file_size_cache.insert(path.clone(), new_size);
-
         if let Some((target_time, time_str)) = limit_opt {
             log_to_file(&format!("[LOCKOUT DETECTED] Rate limit hit! Target: {}", time_str));
             app.is_sleeping = true;
@@ -147,9 +126,26 @@ pub(super) fn check_and_handle_expiry(
             true
         }
         Some(_) => {
-            log_to_file("[Lockout] Target updated during wait. Re-evaluating…");
-            true
+            // Lockout is active, but the target time has not been reached.
+            // Return `false` to allow the main loop to perform its periodic
+            // sleep and cooldown logging. Returning `true` would cause a busy-wait.
+            false
         }
         None => false,
     }
+}
+
+/// Scans a single file, updates its size in the cache, and returns the scan results.
+fn scan_file(
+    path: &PathBuf,
+    old_size: u64,
+    state: &SharedAppState,
+) -> (Option<(DateTime<Local>, String)>, u64) {
+    let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(path, old_size);
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .file_size_cache
+        .insert(path.clone(), new_size);
+    (limit_opt, new_size)
 }
