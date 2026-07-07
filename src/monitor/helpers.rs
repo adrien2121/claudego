@@ -10,7 +10,7 @@ pub(super) const WATCHER_MAX_RETRIES: u32 = 3;
 /// If PTY output was seen within this duration, the scan will be deferred.
 pub(super) const PTY_BUSY_THRESHOLD: Duration = Duration::from_secs(2);
 /// How long to wait before re-checking if the PTY is busy.
-pub(super) const DEFER_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+pub(super) const DEFER_SCAN_INTERVAL: Duration = Duration::from_secs(3);
 
 // Cooldown log cadence thresholds (seconds remaining → log interval).
 const VERY_FAR_THRESHOLD_SECS: u64 = 3 * 60 * 60; // > 3 h  → log every 1 h

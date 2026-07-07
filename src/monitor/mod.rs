@@ -15,8 +15,10 @@ mod formatters;
 mod helpers;
 /// Manages the lifecycle of the file system watcher (creation, recovery).
 mod lifecycle;
-/// Core logic for scanning files and updating application state.
-mod processing;
+/// Core logic for handling runtime file events and lockout expiry.
+mod runtime;
+/// Logic for the initial scan on application startup.
+mod startup;
 
 use lifecycle::WatcherHandle;
 
@@ -34,7 +36,7 @@ enum WaitOutcome {
 pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
     thread::spawn(move || {
         // ── 1. Initial full scan (I/O outside lock) ───────────────────
-        processing::initial_scan(&state);
+        startup::initial_scan(&state);
 
         // ── 2. Create OS file watcher ───────────────────────────────────
         let Some(mut handle) = lifecycle::create_watcher() else {
@@ -64,7 +66,7 @@ pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
                 WaitOutcome::Event(first) => {
                     let paths = events::debounce_events(first, &handle.rx);
                     if !paths.is_empty() {
-                        processing::scan_and_update_state(paths, &state, &mut next_log_time);
+                        runtime::scan_and_update_state(paths, &state, &mut next_log_time);
                     }
                 }
             }
@@ -84,7 +86,7 @@ fn handle_locked_wait(
     let now = Local::now();
     // Check if the lockout has expired.
     if now >= target {
-        processing::handle_expiry(state, writer);
+        runtime::handle_expiry(state, writer);
         return WaitOutcome::ShouldContinue;
     }
 

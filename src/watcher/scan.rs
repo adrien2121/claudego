@@ -3,6 +3,18 @@ use crate::watcher::reset_time;
 use chrono::{DateTime, Local};
 use serde_json::Value;
 
+/// The outcome of scanning a block of text for any rate limit message.
+/// Used during the initial startup scan.
+#[derive(Debug)]
+pub(crate) enum InitialScanResult {
+    /// An active rate limit was found.
+    Active((DateTime<Local>, String)),
+    /// A stale (expired) rate limit was found.
+    Stale,
+    /// No rate limit messages were found in the scanned content.
+    NoLimitFound,
+}
+
 /// Scans string content from the end for the most recent rate limit message.
 ///
 /// # Returns
@@ -19,6 +31,22 @@ pub(crate) fn scan_content_for_limit(content: &str) -> Option<(DateTime<Local>, 
     }
 
     None
+}
+
+/// Scans content from the end, returning the status of the first rate limit message found.
+/// This is more comprehensive than `scan_content_for_limit` because it distinguishes
+/// between finding a stale limit and finding no limit at all.
+pub(crate) fn scan_content_for_any_limit(content: &str) -> InitialScanResult {
+    // Iterate lines in reverse because we only care about the most recent limit.
+    for line in content.lines().rev() {
+        match parse_rate_limit_line(line) {
+            RateLimitLine::Active(limit) => return InitialScanResult::Active(limit),
+            RateLimitLine::Stale => return InitialScanResult::Stale,
+            RateLimitLine::NoMatch => continue,
+        }
+    }
+
+    InitialScanResult::NoLimitFound
 }
 
 /// Parses a single JSON line to check if it is a rate limit error.
