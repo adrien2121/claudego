@@ -1,4 +1,3 @@
-use crate::cli;
 use crate::logging;
 use crate::models::AppState;
 use crate::monitor;
@@ -8,25 +7,19 @@ use anyhow::Result;
 
 use std::sync::{Arc, Mutex};
 
-pub fn run() -> Result<()> {
-    let args = cli::parse(std::env::args().skip(1))?;
-
-    if args.show_help {
-        print!("{}", cli::help_text());
-        return Ok(());
-    }
-
+use crate::cli::CommandSpec;
+pub fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     // Unconditionally start logging
     logging::reset_log_file();
     logging::log_to_file("System initialized successfully. Starting passive monitoring.");
 
     let state = Arc::new(Mutex::new(AppState::new()));
 
-    if args.show_logs {
+    if show_logs {
         open_logs_terminal();
     }
 
-    let mut session = pty_bridge::spawn_command_in_pty(args.command)?;
+    let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
     let _guard = RawModeGuard::init()?;
 
     pty_bridge::spawn_output_reader(session.reader);

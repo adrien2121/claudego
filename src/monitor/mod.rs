@@ -84,15 +84,17 @@ fn handle_locked_wait(
     let now = Local::now();
     // Check if the lockout has expired.
     if now >= target {
-        // If expiry handling is successful, restart the loop immediately.
-        if processing::check_and_handle_expiry(state, writer) {
-            return WaitOutcome::ShouldContinue;
-        }
+        processing::handle_expiry(state, writer);
+        return WaitOutcome::ShouldContinue;
     }
 
-    // Calculate remaining time and wait for an event with a timeout.
+    // The loop must wake up periodically to log cooldown progress. The wait
+    // timeout is the *minimum* of the time to target vs. time to next log.
+    let now_instant = Instant::now();
+    let time_to_next_log = next_log_time.saturating_duration_since(now_instant);
     let to_target = (target - now).to_std().unwrap_or(Duration::ZERO);
-    let event_result = handle.rx.recv_timeout(to_target);
+    let wait_duration = to_target.min(time_to_next_log);
+    let event_result = handle.rx.recv_timeout(wait_duration);
 
     if Instant::now() >= *next_log_time {
         // Log progress periodically during the cooldown.

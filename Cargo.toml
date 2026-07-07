@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.27"
 dirs = "5.0"
@@ -14,6 +15,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 lazy_static = "1.4"
 notify = "8.2.0"
+keepawake = "0.6.0"
 
 [target."cfg(unix)".dependencies]
 signal-hook = "0.4.4"

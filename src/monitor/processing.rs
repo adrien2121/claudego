@@ -103,6 +103,7 @@ pub(super) fn scan_and_update_state(
             log_to_file(&format!("[LOCKOUT DETECTED] Rate limit hit! Target: {}", time_str));
             app.is_sleeping = true;
             app.lockout.target_time = Some(target_time);
+            // A new lockout was detected, so reset the cooldown log timer to force an immediate update.
             *next_log_time = Instant::now();
         } else if app.lockout.target_time.is_some() && file_grew {
             log_to_file("[Lockout Aborted] Normal activity detected. Rate limit bypassed!");
@@ -112,37 +113,20 @@ pub(super) fn scan_and_update_state(
     }
 }
 
-/// Checks if the lockout has expired and handles resuming input.
-/// Returns `true` if the main loop should `continue`.
-pub(super) fn check_and_handle_expiry(
+/// Handles the logic for when a lockout expires.
+pub(super) fn handle_expiry(
     state: &SharedAppState,
     writer: &SharedPtyWriter,
-) -> bool {
-    let current_target = state.lock().unwrap_or_else(|e| e.into_inner()).lockout.target_time;
-
-    match current_target {
-        Some(t) if Local::now() >= t => {
-            log_to_file("[Trigger] Reset time reached. Injecting 'continue' command…");
-            {
-                let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-                let _ = w.write_all(b"continue\r");
-                let _ = w.flush();
-            }
-            {
-                let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-                s.is_sleeping = false;
-                s.lockout.target_time = None;
-                s.file_size_cache.clear();
-            }
-            log_to_file("[System] Resuming passive file monitoring.");
-            true
-        }
-        Some(_) => {
-            // Lockout is active, but the target time has not been reached.
-            // Return `false` to allow the main loop to perform its periodic
-            // sleep and cooldown logging. Returning `true` would cause a busy-wait.
-            false
-        }
-        None => false,
+) {
+    log_to_file("[Trigger] Reset time reached. Injecting 'continue' command…");
+    {
+        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = w.write_all(b"continue\r");
+        let _ = w.flush();
     }
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.is_sleeping = false;
+    s.lockout.target_time = None;
+    s.file_size_cache.clear();
+    log_to_file("[System] Resuming passive file monitoring.");
 }
