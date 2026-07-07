@@ -1,9 +1,11 @@
 use crate::cli::CommandSpec;
+use crate::models::SharedAppState;
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Instant;
 
 pub type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -37,7 +39,7 @@ pub fn spawn_command_in_pty(command: CommandSpec) -> Result<PtySession> {
     })
 }
 
-pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>) {
+pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppState) {
     thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut stdout = io::stdout();
@@ -45,6 +47,12 @@ pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>) {
             if n == 0 {
                 break;
             }
+
+            // Update the activity timestamp to signal that the PTY is busy.
+            if let Ok(mut app) = state.lock() {
+                app.last_pty_activity = Instant::now();
+            }
+
             let _ = stdout.write_all(&buf[..n]);
             let _ = stdout.flush();
         }

@@ -2,106 +2,32 @@ use crate::logging::log_to_file;
 use crate::watcher::reset_time;
 use chrono::{DateTime, Local};
 use serde_json::Value;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 
-const CHUNK_SIZE: u64 = 65536;
-
-/// Scans a log file from the end for rate limit messages.
-///
-/// This function is designed to be called without holding a lock on `AppState`.
-/// It performs all necessary file I/O and returns the results.
-///
-/// # Arguments
-/// * `path` - The path to the `.jsonl` log file.
-/// * `old_size` - The last known size of the file. Used to determine if the file could be opened.
+/// Scans string content from the end for the most recent rate limit message.
 ///
 /// # Returns
-/// A tuple containing:
-/// 1. `Option<(DateTime<Local>, String)>` - The rate limit target time and display string if an active limit is found.
-/// 2. `u64` - The new size of the file.
-pub(crate) fn scan_session_log(
-    path: &Path,
-    old_size: u64,
-) -> (Option<(DateTime<Local>, String)>, u64) {
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(_) => return (None, old_size),
-    };
-    let new_size = match file.metadata() {
-        Ok(m) => m.len(),
-        Err(_) => return (None, old_size),
-    };
-
-    if new_size == 0 {
-        return (None, 0);
-    }
-
-    let limit_opt = scan_file_from_end(&mut file, new_size);
-
-    (limit_opt, new_size)
-}
-
-/// Reads a file in chunks from the end, searching for rate limit messages.
-fn scan_file_from_end(file: &mut File, size: u64) -> Option<(DateTime<Local>, String)> {
-    let mut offset = size;
-    let mut leftover = Vec::new(); // Stores a partial line from a chunk boundary.
-    
-    while offset > 0 {
-        let read_size = std::cmp::min(CHUNK_SIZE, offset);
-        offset -= read_size;
-
-        if file.seek(SeekFrom::Start(offset)).is_err() {
-            break;
-        }
-
-        let mut buf = vec![0u8; read_size as usize];
-        if file.read_exact(&mut buf).is_err() {
-            break;
-        }
-
-        // Prepend leftover from previous chunk to handle lines spanning across chunks.
-        if !leftover.is_empty() {
-            buf.extend(&leftover);
-        }
-
-        let contents = String::from_utf8_lossy(&buf);
-        let mut lines: Vec<&str> = contents.lines().collect();
-
-        // The first line of a chunk may be incomplete; save it for the next read.
-        if offset > 0 && !lines.is_empty() {
-            leftover = lines.remove(0).as_bytes().to_vec();
-        } else {
-            leftover.clear();
-        }
-
-        match scan_lines_newest_first(lines) { // Scan lines from newest to oldest.
-            LineScanResult::ActiveLimit(limit) => return Some(limit),
-            LineScanResult::StaleLimit => break, // Found a stale limit, no need to look further.
-            LineScanResult::NoLimit => {}         // No limit found, continue to the next chunk.
+/// `Option<(DateTime<Local>, String)>` - The rate limit target time and display string if an active limit is found.
+pub(crate) fn scan_content_for_limit(content: &str) -> Option<(DateTime<Local>, String)> {
+    // Iterate lines in reverse because we only care about the most recent limit.
+    for line in content.lines().rev() {
+        match parse_rate_limit_line(line) {
+            RateLimitLine::Active(limit) => return Some(limit),
+            // If we find a stale limit, we can stop. Any earlier limits are, by definition, also stale.
+            RateLimitLine::Stale => return None,
+            RateLimitLine::NoMatch => continue,
         }
     }
 
     None
 }
 
-fn scan_lines_newest_first(lines: Vec<&str>) -> LineScanResult {
-    // Iterate in reverse because we are scanning from the end of the file.
-    for line in lines.into_iter().rev() {
-        match parse_rate_limit_line(line) {
-            RateLimitLine::NoMatch => continue,
-            // A stale limit means older entries are also stale; stop scanning.
-            RateLimitLine::Stale => return LineScanResult::StaleLimit,
-            RateLimitLine::Active(limit) => return LineScanResult::ActiveLimit(limit),
-        }
-    }
-
-    LineScanResult::NoLimit
-}
-
 /// Parses a single JSON line to check if it is a rate limit error.
 fn parse_rate_limit_line(line: &str) -> RateLimitLine {
+    // Optimization: Avoid expensive JSON parsing by doing a cheap string check first.
+    // The vast majority of lines will not be rate limit errors.
+    if !line.contains("rate_limit") {
+        return RateLimitLine::NoMatch;
+    }
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return RateLimitLine::NoMatch;
     };
@@ -150,16 +76,6 @@ fn parse_rate_limit_line(line: &str) -> RateLimitLine {
         display
     ));
     RateLimitLine::Active((target_time, display))
-}
-
-/// Result of scanning a chunk of lines.
-enum LineScanResult {
-    /// An active rate limit was found.
-    ActiveLimit((DateTime<Local>, String)),
-    /// A rate limit was found, but it's in the past (stale).
-    StaleLimit,
-    /// No rate limit was found in the chunk.
-    NoLimit,
 }
 
 /// Result of parsing a single log line.

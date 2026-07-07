@@ -1,5 +1,6 @@
 use crate::logging::log_to_file;
 use crate::models::SharedAppState;
+use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
 use crate::pty_bridge::SharedPtyWriter;
 use crate::watcher::files as watcher_files;
 use chrono::{DateTime, Local};
@@ -22,14 +23,16 @@ pub(super) fn initial_scan(state: &SharedAppState) {
     }
 
     for (path, _) in initial_files {
-        // Perform the scan directly and then update the state in a single lock.
-        let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, 0);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let new_size = content.len() as u64;
+        let limit_opt = crate::watcher::scan::scan_content_for_limit(&content);
+
         state
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .file_size_cache
             .insert(path.clone(), new_size);
-
+        
         if let Some((target, _)) = &limit_opt {
             if latest_limit.as_ref().map_or(true, |(t, _)| target > t) {
                 latest_limit = limit_opt;
@@ -54,6 +57,28 @@ pub(super) fn scan_and_update_state(
     state: &SharedAppState,
     next_log_time: &mut Instant,
 ) {
+    // --- Busy-Wait Logic ---
+    // Before scanning, check if the PTY is actively streaming. If so, wait.
+    // This prevents the file scan's I/O from competing with the PTY reader thread,
+    // which is a direct cause of the "stalled stream" error.
+    loop {
+        let pty_is_busy = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_pty_activity
+            .elapsed() < PTY_BUSY_THRESHOLD;
+
+        if pty_is_busy {
+            log_to_file(&format!(
+                "[Scan Postponed] PTY is busy. Deferring file scan for {:?}.",
+                DEFER_SCAN_INTERVAL
+            ));
+            std::thread::sleep(DEFER_SCAN_INTERVAL);
+        } else {
+            break; // PTY is quiet, proceed with the scan.
+        }
+    }
+
     // Log which files are being scanned.
     let path_names: Vec<_> = paths
         .iter()
@@ -65,50 +90,58 @@ pub(super) fn scan_and_update_state(
     ));
 
     for path in paths {
-        // --- Lock 1: Read old size ---
-        let old_size = {
-            state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .file_size_cache
-                .get(&path)
-                .copied()
-                .unwrap_or(0)
+        let old_size = state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .file_size_cache
+            .get(&path)
+            .copied()
+            .unwrap_or(0);
+
+        let mtime_before = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+
+        let mut new_content = String::new();
+        let bytes_read = if let Ok(mut file) = File::open(&path) {
+            if file.seek(SeekFrom::Start(old_size)).is_ok() {
+                file.read_to_string(&mut new_content).unwrap_or(0)
+            } else {
+                0
+            }
+        } else {
+            0
         };
 
-        // --- Perform all I/O and scanning without holding a lock ---
-        // This is inefficient as the file is read twice: once here for logging,
-        // and once inside `scan_session_log`. A future refactor could combine these.
-        let mut new_content = String::new();
-        if let Ok(mut file) = File::open(&path) {
-            if file.seek(SeekFrom::Start(old_size)).is_ok() {
-                let _ = file.read_to_string(&mut new_content);
-            }
-        }
-        let (limit_opt, new_size) = crate::watcher::scan::scan_session_log(&path, old_size);
-
-        // --- Log content if any was found ---
-        if !new_content.trim().is_empty() {
-            let preview = crate::monitor::formatters::format_file_content_preview(&new_content);
-            log_to_file(&format!("[File Content] New data in {}:\n{}", path.display(), preview));
+        if bytes_read == 0 {
+            continue;
         }
 
-        // --- Lock 2: Update state with all results from the scan ---
-        let mut app = state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        app.file_size_cache.insert(path, new_size);
-        let file_grew = new_size > old_size;
+        let mtime_after = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+
+        // If the file was modified during our read, we abort processing for this cycle.
+        // The file watcher has already picked up the new change, which will trigger a
+        // new scan after the debounce period. This ensures we only act on stable data.
+        if mtime_before.is_some() && mtime_before != mtime_after {
+            log_to_file(&format!(
+                "[Scan Aborted] Concurrent modification of {}. Rescheduling.",
+                path.display()
+            ));
+            continue;
+        }
+
+        let new_size = old_size + bytes_read as u64;
+        let preview = crate::monitor::formatters::format_file_content_preview(&new_content);
+        log_to_file(&format!("[File Content] New data in {}:\n{}", path.display(), preview));
+
+        let limit_opt = crate::watcher::scan::scan_content_for_limit(&new_content);
+
+        let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
+
+        app.file_size_cache.insert(path.clone(), new_size);
         if let Some((target_time, time_str)) = limit_opt {
             log_to_file(&format!("[LOCKOUT DETECTED] Rate limit hit! Target: {}", time_str));
             app.is_sleeping = true;
             app.lockout.target_time = Some(target_time);
-            // A new lockout was detected, so reset the cooldown log timer to force an immediate update.
             *next_log_time = Instant::now();
-        } else if app.lockout.target_time.is_some() && file_grew {
-            log_to_file("[Lockout Aborted] Normal activity detected. Rate limit bypassed!");
-            app.is_sleeping = false;
-            app.lockout.target_time = None;
         }
     }
 }

@@ -22,7 +22,7 @@ pub fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
     let _guard = RawModeGuard::init()?;
 
-    pty_bridge::spawn_output_reader(session.reader);
+    pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
     pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
     pty_bridge::spawn_resize_poller(session.master, session.initial_size);
     monitor::spawn_lockout_monitor(state, Arc::clone(&session.writer));
