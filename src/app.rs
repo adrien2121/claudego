@@ -5,14 +5,35 @@ use crate::pty_bridge;
 use crate::terminal::RawModeGuard;
 use anyhow::Result;
 
+use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::CommandSpec;
+
+/// An RAII guard to ensure the logger is shut down gracefully.
+/// When this guard is dropped (at the end of the `run` function's scope),
+/// it signals the logger thread to flush all pending messages and terminate.
+struct LoggerGuard(Option<JoinHandle<()>>);
+
+impl Drop for LoggerGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            logging::log_to_file("[System] Main process shutting down. Flushing logs...");
+            // Send the shutdown signal and wait for the logger thread to finish.
+            logging::shutdown_logging(handle);
+        }
+    }
+}
+
 pub fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     // Unconditionally start logging
+    // 1. Clear the old log file before the logger thread starts.
     logging::reset_log_file();
-    logging::log_to_file("System initialized successfully. Starting passive monitoring.");
-
+    // 2. Initialize the new asynchronous logger.
+    let logger_handle = logging::init_logging();
+    // The first log message now goes through the new async system.
+    let _logger_guard = LoggerGuard(Some(logger_handle));
+    logging::log_to_file("System initialized. Logger active. Starting passive monitoring.");
     let state = Arc::new(Mutex::new(AppState::new()));
 
     if show_logs {
@@ -28,6 +49,8 @@ pub fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     monitor::spawn_lockout_monitor(state, Arc::clone(&session.writer));
 
     let _ = session.child.wait()?;
+
+    logging::log_to_file("[System] Child process exited. Shutting down.");
     Ok(())
 }
 

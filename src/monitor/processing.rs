@@ -6,7 +6,7 @@ use crate::watcher::files as watcher_files;
 use chrono::{DateTime, Local};
 use std::collections::HashSet;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::{Instant, SystemTime};
 
@@ -129,8 +129,9 @@ pub(super) fn scan_and_update_state(
         }
 
         let new_size = old_size + bytes_read as u64;
-        let preview = crate::monitor::formatters::format_file_content_preview(&new_content);
-        log_to_file(&format!("[File Content] New data in {}:\n{}", path.display(), preview));
+        // Generate a preview of the new content for the logs.
+        let content_preview = crate::monitor::formatters::create_content_preview(&new_content);
+        crate::logging::log_with_content(&format!("[File Content] New data in {}:", path.display()), content_preview);
 
         let limit_opt = crate::watcher::scan::scan_content_for_limit(&new_content);
 
