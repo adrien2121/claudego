@@ -14,6 +14,10 @@ use tokio::time::{sleep, Duration};
 /// content, we cap the content collected for logging to 1 MiB.
 const MAX_PREVIEW_CONTENT_SIZE: usize = 1_048_576;
 
+/// When scanning a modified file, re-scan this many bytes from the end of the
+/// previously seen content to be robust against missed initial detections.
+const SCAN_OVERLAP_BYTES: u64 = 4096;
+
 /// Scans a set of changed paths and updates the application state.
 pub(super) async fn scan_and_update_state(
     paths: HashSet<PathBuf>,
@@ -69,9 +73,7 @@ pub(super) async fn scan_and_update_state(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .file_size_cache
-            .get(&path)
-            .copied()
-            .unwrap_or(0);
+            .get(&path).copied().unwrap_or(0); // If not in cache, this is the first time we see it.
 
         let mtime_before = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
         let new_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(old_size);
@@ -101,18 +103,35 @@ pub(super) async fn scan_and_update_state(
                 // Safety: File is read-only. OS handles paging.
                 match unsafe { memmap2::Mmap::map(&file) } {
                     Ok(mmap) => {
-                        // Slice the mmap to only the new content.
-                        let new_content_slice = &mmap[old_size as usize..new_size as usize];
-                        let new_content_str = String::from_utf8_lossy(new_content_slice);
+                        // To be robust, we don't just scan the new content. We re-scan a small
+                        // portion of the old content as well. This helps if the initial scan
+                        // missed a limit that was at the very end of the file at startup.
+                        let scan_start = old_size.saturating_sub(SCAN_OVERLAP_BYTES);
+                        let scan_slice = &mmap[scan_start as usize..new_size as usize];
 
-                        // 1. Generate a preview for logging from the start of the new content.
-                        let preview_len = new_content_str.len().min(MAX_PREVIEW_CONTENT_SIZE);
-                        let content_preview =
-                            crate::monitor::formatters::create_content_preview(&new_content_str[..preview_len]);
-                        log_with_content(&format!("[File Content] New data in {}:", path.display()), content_preview);
+                        match std::str::from_utf8(scan_slice) {
+                            Ok(scan_str) => {
+                                // 1. Generate a preview for logging. The preview should only
+                                //    show the *truly new* content, not the overlap.
+                                let new_content_offset = old_size.saturating_sub(scan_start) as usize;
+                                if new_content_offset < scan_str.len() {
+                                    let new_content_for_preview = &scan_str[new_content_offset..];
+                                    let preview_len = new_content_for_preview.len().min(MAX_PREVIEW_CONTENT_SIZE);
+                                    let content_preview =
+                                        crate::monitor::formatters::create_content_preview(
+                                            &new_content_for_preview[..preview_len],
+                                        );
+                                    log_with_content(&format!("[File Content] New data in {}:", path.display()), content_preview);
+                                }
 
-                        // 2. Scan the new content for a rate limit.
-                        crate::watcher::scan::scan_content_for_limit(&new_content_str)
+                                // 2. Scan the entire slice (including overlap) for a rate limit.
+                                crate::watcher::scan::scan_content_for_limit(scan_str)
+                            }
+                            Err(_) => {
+                                log_to_file(&format!("[Scan Warning] Invalid UTF-8 in new content of {}. Skipping.", path.display()));
+                                None
+                            }
+                        }
                     }
                     Err(e) => {
                         log_to_file(&format!("[Scan Error] Failed to mmap {}: {}", path.display(), e));

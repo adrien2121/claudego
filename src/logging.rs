@@ -53,6 +53,11 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
         }
         let mut clients: Vec<TcpStream> = Vec::new();
 
+        // Buffer for logs generated before the first client connects. This ensures
+        // the log viewer gets the full startup history.
+        let mut initial_buffer: Vec<String> = Vec::new();
+        let mut has_first_client_connected = false;
+
         // --- 2. Set up file writer for persistent logs ---
         let mut writer = match tokio::fs::OpenOptions::new()
             .create(true)
@@ -75,8 +80,27 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
         loop {
             tokio::select! {
                 // A. Accept any new incoming connections for live logging.
-                Ok((stream, _)) = listener.accept() => {
-                    clients.push(stream);
+                Ok((mut stream, _)) = listener.accept() => {
+                    let mut client_ok = true;
+                    if !has_first_client_connected {
+                        // This is the first client. Dump the startup log buffer to it.
+                        for line in &initial_buffer {
+                            if stream.write_all(line.as_bytes()).await.is_err() {
+                                // If we can't even write the buffer, this client is no good.
+                                client_ok = false;
+                                break;
+                            }
+                        }
+                        if client_ok {
+                            // Successfully dumped buffer. Transition to live streaming mode.
+                            initial_buffer.clear();
+                            initial_buffer.shrink_to_fit();
+                            has_first_client_connected = true;
+                        }
+                    }
+                    if client_ok {
+                        clients.push(stream);
+                    }
                 }
 
                 // B. Check for a message from the application.
@@ -85,16 +109,20 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
                         LogMessage::Line(mut line) => {
                             line.push('\n'); // Ensure line has a newline for streams
 
-                            // B.1. Send to live-log network clients
-                            let mut dead_clients = Vec::new();
-                            for (i, client) in clients.iter_mut().enumerate() {
-                                if client.write_all(line.as_bytes()).await.is_err() {
-                                    dead_clients.push(i);
+                            // B.1. Send to live-log network clients or buffer if none have connected.
+                            if !has_first_client_connected {
+                                initial_buffer.push(line.clone());
+                            } else {
+                                let mut dead_clients = Vec::new();
+                                for (i, client) in clients.iter_mut().enumerate() {
+                                    if client.write_all(line.as_bytes()).await.is_err() {
+                                        dead_clients.push(i);
+                                    }
                                 }
-                            }
-                            // Remove dead clients in reverse to preserve indices
-                            for i in dead_clients.into_iter().rev() {
-                                clients.remove(i);
+                                // Remove dead clients in reverse to preserve indices
+                                for i in dead_clients.into_iter().rev() {
+                                    clients.remove(i);
+                                }
                             }
 
                             // B.2. Write to persistent log file (buffered)

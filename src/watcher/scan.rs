@@ -60,45 +60,38 @@ fn parse_rate_limit_line(line: &str) -> RateLimitLine {
         return RateLimitLine::NoMatch;
     };
 
-    // We only care about "rate_limit" errors.
     if value["error"].as_str() != Some("rate_limit") {
         return RateLimitLine::NoMatch;
     }
 
-    log_to_file("  [MATCH] Active 'rate_limit' row found! Parsing contents...");
-
+    // --- All checks below this point are for a potential rate_limit error ---
     let Some(raw_timestamp) = value["timestamp"].as_str() else {
         return RateLimitLine::NoMatch;
     };
-
     let Ok(log_time) =
         DateTime::parse_from_rfc3339(raw_timestamp).map(|time| time.with_timezone(&Local))
     else {
         return RateLimitLine::NoMatch;
     };
-
     let Some(content_text) = value["message"]["content"][0]["text"].as_str() else {
         return RateLimitLine::NoMatch;
     };
 
-    log_to_file(&format!(
-        "  [Extracted Text] Raw Limit Message: \"{}\"",
-        content_text
-    ));
-
-    // Extract the reset time from the error message text.
     let Some((target_time, display)) = reset_time::parse_reset_time(log_time, content_text) else {
-        return RateLimitLine::NoMatch;
+        // This is a rate limit, but not one we can parse a time from (e.g., "Fable 5 limit").
+        // Treat it as Stale to stop scanning this file further, but don't log verbosely.
+        return RateLimitLine::Stale;
     };
 
-    // If the reset time is in the past, the limit is stale.
     if Local::now() > target_time {
-        log_to_file(
-            "  [STALE] Reset time targets evaluated to the past. Ignoring historical match.",
-        );
+        // This is a historical, expired limit. It's not an error, but we don't
+        // need to log it verbosely during the noisy startup scan.
         return RateLimitLine::Stale;
     }
 
+    // This is a valid, *active* limit. Now we log the details.
+    log_to_file("  [MATCH] Active 'rate_limit' row found! Parsing contents...");
+    log_to_file(&format!("  [Extracted Text] Raw Limit Message: \"{}\"", content_text));
     log_to_file(&format!(
         "  [SUCCESS] Valid active limit confirmed! Resets: {}",
         display

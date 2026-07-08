@@ -28,7 +28,7 @@ pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
         startup::initial_scan(&state);
 
         // ── 2. Create OS file watcher ───────────────────────────────────
-        let Some(mut handle) = lifecycle::create_watcher() else {
+        let Some(mut handle) = lifecycle::create_watcher().await else {
             return;
         };
         log_to_file("[System] Event-driven file watcher active. Blocking until events arrive.");
@@ -105,7 +105,7 @@ async fn handle_event_result(
         None => {
             // The watcher channel disconnected. Attempt to recover.
             log_to_file("[Watcher] Disconnected. Attempting recovery…");
-            if let Some(new_handle) = lifecycle::create_watcher() {
+            if let Some(new_handle) = lifecycle::create_watcher().await {
                 *handle = new_handle;
             } else {
                 // If recovery fails, we can't do much more. The task will exit.

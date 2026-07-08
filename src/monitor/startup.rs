@@ -39,14 +39,20 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
         // Prepend the partial line from the previous iteration to complete any split lines.
         buffer.append(&mut carry_forward);
 
-        let content_to_scan: std::borrow::Cow<str>;
+        let content_to_scan: &str;
 
         // If we are not at the start of the file, the beginning of our buffer might
         // be a partial line. We save it for the next iteration.
         if read_start > 0 {
             if let Some(first_newline_pos) = memchr::memchr(b'\n', &buffer) {
                 carry_forward.extend_from_slice(&buffer[..first_newline_pos]);
-                content_to_scan = String::from_utf8_lossy(&buffer[first_newline_pos..]);
+                // Avoid allocation from `from_utf8_lossy` by using `from_utf8`.
+                // If a chunk is not valid UTF-8, it cannot contain our JSON log line,
+                // so we can safely skip it.
+                match std::str::from_utf8(&buffer[first_newline_pos..]) {
+                    Ok(s) => content_to_scan = s,
+                    Err(_) => continue, // Skip chunk with invalid UTF-8.
+                }
             } else {
                 // The whole chunk has no newline, so it's all a partial line.
                 // We move the buffer's content to carry_forward for the next iteration.
@@ -57,7 +63,10 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
             }
         } else {
             // This is the first chunk of the file, so process everything.
-            content_to_scan = String::from_utf8_lossy(&buffer);
+            match std::str::from_utf8(&buffer) {
+                Ok(s) => content_to_scan = s,
+                Err(_) => break, // End of file and it's invalid, nothing more to do.
+            }
         }
 
         // We must use `scan_content_for_any_limit` to correctly stop at the
@@ -111,11 +120,10 @@ pub(super) fn initial_scan(state: &SharedAppState) {
                 log_to_file(&format!("[Startup] Error scanning file {}: {}", path.display(), e));
             }
         }
-
-        // Add a blank line for readability between file scans during startup.
-        log_to_file("");
     }
 
+    // Add a blank line for readability after the initial scan section.
+    log_to_file("");
     if let Some((target_time, time_str)) = latest_limit {
         log_to_file(&format!("[LOCKOUT ON STARTUP] Rate limit found. Target: {}", time_str));
         let mut app = state.lock().unwrap_or_else(|e| e.into_inner());

@@ -1,8 +1,7 @@
 use super::helpers::WATCHER_MAX_RETRIES;
 use crate::logging::log_to_file;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result, Watcher};
-use std::thread;
-use std::time::Duration;
+use tokio::time::{sleep, Duration};
 use tokio::sync::mpsc::{self, Receiver};
 
 /// Bundles the OS watcher (must stay alive) with its event receiver.
@@ -13,7 +12,7 @@ pub(super) struct WatcherHandle {
 
 /// Create a recursive file watcher on `~/.claude/projects`, retrying with
 /// exponential backoff (1 s, 2 s, 4 s) on transient failures.
-pub(super) fn create_watcher() -> Option<WatcherHandle> {
+pub(super) async fn create_watcher() -> Option<WatcherHandle> {
     let projects_root = crate::watcher::files::claude_projects_root()?;
     let _ = std::fs::create_dir_all(&projects_root);
 
@@ -57,7 +56,7 @@ pub(super) fn create_watcher() -> Option<WatcherHandle> {
         if attempt + 1 < WATCHER_MAX_RETRIES {
             let backoff = Duration::from_secs(1 << attempt);
             log_to_file(&format!("[Watcher] Retrying in {:?}…", backoff));
-            thread::sleep(backoff);
+            sleep(backoff).await;
         }
     }
 
