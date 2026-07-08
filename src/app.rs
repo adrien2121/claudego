@@ -4,44 +4,29 @@ use crate::monitor;
 use crate::pty_bridge;
 use crate::terminal::RawModeGuard;
 use anyhow::Result;
-use std::time::Duration;
 
-use std::thread::JoinHandle;
 use std::sync::{Arc, Mutex};
 
 use crate::cli::CommandSpec;
 
-/// An RAII guard to ensure the logger is shut down gracefully.
-/// When this guard is dropped (at the end of the `run` function's scope),
-/// it signals the logger thread to flush all pending messages and terminate.
-struct LoggerGuard(Option<JoinHandle<()>>);
-
-impl Drop for LoggerGuard {
-    fn drop(&mut self) {
-        if let Some(handle) = self.0.take() {
-            logging::log_to_file("[System] Main process shutting down. Flushing logs...");
-            // Send the shutdown signal and wait for the logger thread to finish.
-            logging::shutdown_logging(handle);
-        }
-    }
-}
-
-pub fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
+pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     // Unconditionally start logging
     // 1. Clear the old log file before the logger thread starts.
     logging::reset_log_file();
     // 2. Initialize the new asynchronous logger.
     // It now returns a handle and a receiver to signal when the TCP server is ready.
     let (logger_handle, logger_ready_rx) = logging::init_logging();
-    // The first log message now goes through the new async system.
-    let _logger_guard = LoggerGuard(Some(logger_handle));
     logging::log_to_file("System initialized. Logger active. Starting passive monitoring.");
     let state = Arc::new(Mutex::new(AppState::new()));
 
     if show_logs {
         // Wait for the logger thread to signal that the TCP server is bound and ready.
         // This prevents a race condition where claudego-logs starts before the port is known.
-        if logger_ready_rx.recv_timeout(Duration::from_secs(5)).is_ok() {
+        // We use a blocking recv here because it's part of the initial setup, before the main async logic.
+        if logger_ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .is_ok()
+        {
             open_logs_terminal();
         } else {
             println!("[System] Warning: Live log viewer failed to start (logger did not become ready).");
@@ -56,9 +41,14 @@ pub fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     pty_bridge::spawn_resize_poller(session.master, session.initial_size);
     monitor::spawn_lockout_monitor(state, Arc::clone(&session.writer));
 
-    let _ = session.child.wait()?;
+    // Move the blocking `wait` call to a dedicated thread to avoid blocking the tokio runtime.
+    let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
+    let _ = child_wait_handle.await??;
 
     logging::log_to_file("[System] Child process exited. Shutting down.");
+    // Gracefully shut down the logger, ensuring all messages are flushed.
+    logging::shutdown_logging(logger_handle).await;
+
     Ok(())
 }
 

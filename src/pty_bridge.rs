@@ -5,7 +5,7 @@ use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, P
 use std::io::{self, Read, Write};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::thread;
+use tokio::task;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
@@ -41,7 +41,7 @@ pub fn spawn_command_in_pty(command: CommandSpec) -> Result<PtySession> {
 }
 
 pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppState) {
-    thread::spawn(move || {
+    task::spawn_blocking(move || {
         // Clone the atomic tracker once to avoid locking the state in the loop.
         let activity_tracker = state.lock().unwrap().last_pty_activity.clone();
         let mut buf = [0u8; 1024];
@@ -61,7 +61,7 @@ pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppSta
 }
 
 pub fn spawn_input_writer(writer: SharedPtyWriter) {
-    thread::spawn(move || {
+    task::spawn_blocking(move || {
         let mut buf = [0u8; 1024];
         let mut stdin = io::stdin();
         while let Ok(n) = stdin.read(&mut buf) {
@@ -69,9 +69,7 @@ pub fn spawn_input_writer(writer: SharedPtyWriter) {
                 break;
             }
 
-            let mut pty_writer = writer
-                .lock()
-                .expect("PTY writer lock was poisoned");
+            let mut pty_writer = writer.lock().expect("PTY writer lock was poisoned");
             if pty_writer.write_all(&buf[..n]).is_err() {
                 break;
             }
@@ -82,7 +80,7 @@ pub fn spawn_input_writer(writer: SharedPtyWriter) {
 
 pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: TerminalSize) {
     #[cfg(unix)]
-    thread::spawn(move || {
+    task::spawn_blocking(move || {
         use signal_hook::consts::SIGWINCH;
         use signal_hook::iterator::Signals;
 
@@ -100,10 +98,10 @@ pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: Term
     });
 
     #[cfg(not(unix))]
-    thread::spawn(move || {
+    task::spawn(async move {
         let mut current_size = initial_size;
         loop {
-            thread::sleep(Duration::from_millis(200));
+            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
             if let Ok(new_size) = crossterm::terminal::size() {
                 if new_size != current_size {
                     current_size = new_size;
@@ -113,6 +111,7 @@ pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: Term
         }
     });
 }
+
 
 fn build_command(command: CommandSpec) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(command.program);

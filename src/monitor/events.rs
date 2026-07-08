@@ -1,32 +1,27 @@
 use super::helpers::DEBOUNCE_DURATION;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::mpsc::Receiver;
-use std::sync::mpsc::RecvTimeoutError;
-use std::time::Instant;
+use tokio::sync::mpsc::Receiver;
+use tokio::time::timeout;
 
 /// After receiving `first_event`, drain the channel for `DEBOUNCE_DURATION`
 /// and return all unique `.jsonl` paths from Modify/Create events.
-pub(super) fn debounce_events(
+pub(super) async fn debounce_events(
     first_event: notify::Event,
-    rx: &Receiver<Result<notify::Event, notify::Error>>,
+    rx: &mut Receiver<notify::Result<notify::Event>>,
 ) -> HashSet<PathBuf> {
     let mut paths = HashSet::new();
     collect_jsonl_paths(&first_event, &mut paths);
 
-    let deadline = Instant::now() + DEBOUNCE_DURATION;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
+    // After the first event, keep collecting subsequent events for the debounce duration.
+    // The `timeout` will cancel the inner loop when the duration is up.
+    let _ = timeout(DEBOUNCE_DURATION, async {
+        while let Some(Ok(event)) = rx.recv().await {
+            collect_jsonl_paths(&event, &mut paths);
         }
-        match rx.recv_timeout(remaining) {
-            Ok(Ok(event)) => collect_jsonl_paths(&event, &mut paths),
-            Ok(Err(_)) => {}                        // notify-internal error, skip
-            Err(RecvTimeoutError::Timeout) => break, // debounce window closed
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
+    })
+    .await;
+
     paths
 }
 

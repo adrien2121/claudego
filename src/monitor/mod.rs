@@ -2,10 +2,9 @@ use crate::logging::log_to_file;
 use crate::models::SharedAppState;
 use crate::pty_bridge::SharedPtyWriter;
 use crate::time_format::format_duration;
-use chrono::{DateTime, Local};
-use std::sync::mpsc::RecvTimeoutError;
-use std::thread;
-use std::time::{Duration, Instant};
+use chrono::Local;
+use std::time::Instant;
+use tokio::time::{sleep, Duration};
 
 /// Handles debouncing and collecting file system events.
 mod events;
@@ -22,19 +21,9 @@ mod startup;
 
 use lifecycle::WatcherHandle;
 
-/// Represents the outcome of a wait operation in the main event loop.
-enum WaitOutcome {
-    /// A file event was received.
-    Event(notify::Event),
-    /// The loop should immediately restart.
-    ShouldContinue,
-    /// The watcher died and could not be recovered.
-    WatcherDied,
-}
-
 /// Spawns a dedicated thread to monitor Claude log files for rate limit lockouts.
 pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
-    thread::spawn(move || {
+    tokio::spawn(async move {
         // ── 1. Initial full scan (I/O outside lock) ───────────────────
         startup::initial_scan(&state);
 
@@ -47,101 +36,82 @@ pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
 
         // ── 3. Event loop ───────────────────────────────────────────────
         loop {
-            // Snapshot the current lockout target (short lock).
-            let lockout_target = { state.lock().unwrap_or_else(|e| e.into_inner()).lockout.target_time };
-            
-            // The waiting strategy depends on whether a lockout is currently active.
-            let outcome = match lockout_target {
-                Some(target) => {
-                    // Lockout is active: wait with a timeout until the lockout expires.
-                    handle_locked_wait(target, &mut handle, &mut next_log_time, &state, &writer)
-                }
-                None => handle_unlocked_wait(&mut handle), // No lockout: wait indefinitely for a file event.
+            let lockout_target = {
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .lockout
+                    .target_time
             };
 
-            match outcome {
-                // Process file events that were received.
-                WaitOutcome::ShouldContinue => continue,
-                WaitOutcome::WatcherDied => return,
-                WaitOutcome::Event(first) => {
-                    let paths = events::debounce_events(first, &handle.rx);
-                    if !paths.is_empty() {
-                        runtime::scan_and_update_state(paths, &state, &mut next_log_time);
+            if let Some(target) = lockout_target {
+                // --- Lockout is ACTIVE ---
+                let now = Local::now();
+                if now >= target {
+                    runtime::handle_expiry(&state, &writer, target);
+                    continue; // Re-evaluate state immediately
+                }
+
+                let time_to_target = (target - now).to_std().unwrap_or(Duration::ZERO);
+
+                // Log progress if it's time
+                if Instant::now() >= next_log_time {
+                    let remaining_secs = (target - Local::now()).num_seconds().max(0);
+                    if remaining_secs > 0 {
+                        let interval = helpers::cooldown_log_interval(remaining_secs);
+                        log_to_file(&format!(
+                            "[Lockout Cooldown] {} remaining. Next log in {}.",
+                            format_duration(remaining_secs),
+                            format_duration(interval.as_secs() as i64),
+                        ));
+                        next_log_time = Instant::now() + interval;
                     }
                 }
+
+                let time_to_next_log = next_log_time.saturating_duration_since(Instant::now());
+                let wait_duration = time_to_target.min(time_to_next_log);
+
+                tokio::select! {
+                    _ = sleep(wait_duration) => {
+                        // Timer expired, loop will check if lockout is over or log progress.
+                    }
+                    event_res = handle.rx.recv() => {
+                        handle_event_result(event_res, &mut handle, &state, &mut next_log_time).await;
+                    }
+                }
+            } else {
+                // --- No lockout, wait for a file event ---
+                let event_res = handle.rx.recv().await;
+                handle_event_result(event_res, &mut handle, &state, &mut next_log_time).await;
             }
         }
     });
 }
 
-/// Handles the waiting logic when a lockout is active.
-/// It waits for either a file event or for the lockout duration to expire.
-fn handle_locked_wait(
-    target: DateTime<Local>,
+async fn handle_event_result(
+    event_res: Option<notify::Result<notify::Event>>,
     handle: &mut WatcherHandle,
-    next_log_time: &mut Instant,
     state: &SharedAppState,
-    writer: &SharedPtyWriter,
-) -> WaitOutcome {
-    let now = Local::now();
-    // Check if the lockout has expired.
-    if now >= target {
-        runtime::handle_expiry(state, writer, target);
-        return WaitOutcome::ShouldContinue;
-    }
-
-    // The loop must wake up periodically to log cooldown progress. The wait
-    // timeout is the *minimum* of the time to target vs. time to next log.
-    let now_instant = Instant::now();
-    let time_to_next_log = next_log_time.saturating_duration_since(now_instant);
-    let to_target = (target - now).to_std().unwrap_or(Duration::ZERO);
-    let wait_duration = to_target.min(time_to_next_log);
-    let event_result = handle.rx.recv_timeout(wait_duration);
-
-    if Instant::now() >= *next_log_time {
-        // Log progress periodically during the cooldown.
-        let remaining_secs = (target - Local::now()).num_seconds().max(0);
-        if remaining_secs > 0 {
-            let interval = helpers::cooldown_log_interval(remaining_secs);
-            log_to_file(&format!(
-                "[Lockout Cooldown] {} remaining. Next log in {}.",
-                format_duration(remaining_secs),
-                format_duration(interval.as_secs() as i64),
-            ));
-            *next_log_time = Instant::now() + interval;
+    next_log_time: &mut Instant,
+) {
+    match event_res {
+        Some(Ok(first_event)) => {
+            let paths = events::debounce_events(first_event, &mut handle.rx).await;
+            if !paths.is_empty() {
+                runtime::scan_and_update_state(paths, state, next_log_time).await;
+            }
         }
-    }
-
-    match event_result {
-        Ok(Ok(ev)) => WaitOutcome::Event(ev),
-        // A `notify` error occurred, but the channel is fine. Continue.
-        Ok(Err(_)) => WaitOutcome::ShouldContinue,
-        // Timeout means the lockout expired. Loop will re-evaluate.
-        Err(RecvTimeoutError::Timeout) => WaitOutcome::ShouldContinue,
-        // The watcher channel disconnected. Attempt to recover.
-        Err(RecvTimeoutError::Disconnected) => recover_watcher(handle),
-    }
-}
-
-/// Attempts to recover a disconnected file system watcher.
-fn recover_watcher(handle: &mut WatcherHandle) -> WaitOutcome {
-    log_to_file("[Watcher] Disconnected. Attempting recovery…");
-    match lifecycle::create_watcher() {
-        Some(new_handle) => {
-            *handle = new_handle;
-            WaitOutcome::ShouldContinue
+        Some(Err(_)) => { /* A notify error occurred, but the channel is fine. Continue. */ }
+        None => {
+            // The watcher channel disconnected. Attempt to recover.
+            log_to_file("[Watcher] Disconnected. Attempting recovery…");
+            if let Some(new_handle) = lifecycle::create_watcher() {
+                *handle = new_handle;
+            } else {
+                // If recovery fails, we can't do much more. The task will exit.
+                // In a real-world robust scenario, this might try to panic and restart the process.
+                log_to_file("[Watcher Error] CRITICAL: Watcher recovery failed. Monitoring has stopped.");
+            }
         }
-        None => WaitOutcome::WatcherDied,
-    }
-}
-
-/// Handles the waiting logic when no lockout is active.
-/// It blocks indefinitely until a file system event is received.
-fn handle_unlocked_wait(handle: &mut WatcherHandle) -> WaitOutcome {
-    match handle.rx.recv() {
-        Ok(Ok(ev)) => WaitOutcome::Event(ev),
-        // A `notify` error occurred, but the channel is fine. Continue.
-        Ok(Err(_)) => WaitOutcome::ShouldContinue,
-        Err(_) => recover_watcher(handle),
     }
 }

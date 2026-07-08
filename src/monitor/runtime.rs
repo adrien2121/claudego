@@ -1,21 +1,21 @@
 use crate::logging::{log_to_file, log_with_content};
 use crate::models::SharedAppState;
-use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD, SCAN_CHUNK_SIZE};
+use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
 use crate::pty_bridge::SharedPtyWriter;
 use chrono::{DateTime, Local};
+use memmap2;
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use tokio::time::{sleep, Duration};
 
 /// To prevent unbounded memory usage when a log file has a very large amount of new
 /// content, we cap the content collected for logging to 1 MiB.
 const MAX_PREVIEW_CONTENT_SIZE: usize = 1_048_576;
 
 /// Scans a set of changed paths and updates the application state.
-pub(super) fn scan_and_update_state(
+pub(super) async fn scan_and_update_state(
     paths: HashSet<PathBuf>,
     state: &SharedAppState,
     next_log_time: &mut Instant,
@@ -24,7 +24,10 @@ pub(super) fn scan_and_update_state(
     // Before scanning, check if the PTY is actively streaming. If so, wait.
     // This prevents the file scan's I/O from competing with the PTY reader thread,
     // which is a direct cause of the "stalled stream" error.
-    let activity_tracker = state.lock().unwrap().last_pty_activity.clone();
+    let activity_tracker = {
+        let app = state.lock().unwrap();
+        app.last_pty_activity.clone()
+    };
     loop {
         let last_activity_ns = activity_tracker.load(Ordering::Relaxed);
         let pty_is_busy = if last_activity_ns == 0 {
@@ -42,10 +45,10 @@ pub(super) fn scan_and_update_state(
 
         if pty_is_busy {
             log_to_file(&format!(
-                "[Scan Postponed] Command is actively streaming output. Deferring file scan for {:?}.",
-                DEFER_SCAN_INTERVAL
+                "Claude is currently streaming output. Deferring file scan for {:?}.",
+                DEFER_SCAN_INTERVAL,
             ));
-            std::thread::sleep(DEFER_SCAN_INTERVAL);
+            sleep(DEFER_SCAN_INTERVAL).await;
         } else {
             break; // PTY is quiet, proceed with the scan.
         }
@@ -71,13 +74,9 @@ pub(super) fn scan_and_update_state(
             .unwrap_or(0);
 
         let mtime_before = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let new_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(old_size);
 
-        let (new_content, bytes_read, limit_opt) = match scan_new_content_chunked(&path, old_size) {
-            Ok(result) => result,
-            Err(_) => continue,
-        };
-
-        if bytes_read == 0 {
+        if new_size <= old_size {
             continue;
         }
 
@@ -88,20 +87,49 @@ pub(super) fn scan_and_update_state(
         // new scan after the debounce period. This ensures we only act on stable data.
         if mtime_before.is_some() && mtime_before != mtime_after {
             log_to_file(&format!(
-                "[Scan Aborted] Concurrent modification of {}. Rescheduling.",
+                "[Scan Aborted] Concurrent modification of {}. Rescheduling scan.",
                 path.display()
             ));
             continue;
         }
 
-        let new_size = old_size + bytes_read;
-        // Generate a preview of the new content for the logs.
-        let content_preview = crate::monitor::formatters::create_content_preview(&new_content);
-        log_with_content(&format!("[File Content] New data in {}:", path.display()), content_preview);
+        // --- Single-Pass Scan & Preview using Memory-Mapping ---
+        // We use a memory map for a highly efficient, single-pass operation.
+        // This avoids multiple file reads and complex buffer management.
+        let limit_opt = match std::fs::File::open(&path) {
+            Ok(file) => {
+                // Safety: File is read-only. OS handles paging.
+                match unsafe { memmap2::Mmap::map(&file) } {
+                    Ok(mmap) => {
+                        // Slice the mmap to only the new content.
+                        let new_content_slice = &mmap[old_size as usize..new_size as usize];
+                        let new_content_str = String::from_utf8_lossy(new_content_slice);
 
+                        // 1. Generate a preview for logging from the start of the new content.
+                        let preview_len = new_content_str.len().min(MAX_PREVIEW_CONTENT_SIZE);
+                        let content_preview =
+                            crate::monitor::formatters::create_content_preview(&new_content_str[..preview_len]);
+                        log_with_content(&format!("[File Content] New data in {}:", path.display()), content_preview);
+
+                        // 2. Scan the new content for a rate limit.
+                        crate::watcher::scan::scan_content_for_limit(&new_content_str)
+                    }
+                    Err(e) => {
+                        log_to_file(&format!("[Scan Error] Failed to mmap {}: {}", path.display(), e));
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                log_to_file(&format!("[Scan Error] Failed to open {}: {}", path.display(), e));
+                None
+            }
+        };
+
+        // --- Update State ---
         let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
+        app.file_size_cache.insert(path, new_size);
 
-        app.file_size_cache.insert(path.clone(), new_size);
         if let Some((target_time, time_str)) = limit_opt {
             log_to_file(&format!("[LOCKOUT DETECTED] Rate limit hit! Target: {}", time_str));
             app.is_sleeping = true;
@@ -109,56 +137,6 @@ pub(super) fn scan_and_update_state(
             *next_log_time = Instant::now();
         }
     }
-}
-
-/// Scans new content in a file from a given offset, chunk by chunk, to avoid
-/// allocating a potentially huge string for all the new content at once.
-/// Returns all new content read (for logging), the total bytes read, and the
-/// most recent active limit found.
-fn scan_new_content_chunked(
-    path: &PathBuf,
-    old_size: u64,
-) -> IoResult<(String, u64, Option<(DateTime<Local>, String)>)> {
-    let mut file = File::open(path)?;
-    file.seek(SeekFrom::Start(old_size))?;
-
-    let mut reader = std::io::BufReader::new(file);
-    let mut full_new_content = String::new();
-    let mut latest_limit: Option<(DateTime<Local>, String)> = None;
-    let mut total_bytes_read = 0;
-
-    let mut chunk_buf = vec![0; SCAN_CHUNK_SIZE];
-    loop {
-        let bytes_read = reader.read(&mut chunk_buf)?;
-
-        if bytes_read == 0 {
-            break;
-        }
-        total_bytes_read += bytes_read as u64;
-
-        let data_slice = &chunk_buf[..bytes_read];
-
-        // Using from_utf8_lossy is pragmatic for logging.
-        // We accumulate the new content for logging, but cap it to avoid
-        // unbounded memory allocation if the file change is massive.
-        let content_chunk = String::from_utf8_lossy(data_slice);
-        if full_new_content.len() < MAX_PREVIEW_CONTENT_SIZE {
-            let remaining_space = MAX_PREVIEW_CONTENT_SIZE - full_new_content.len();
-            if content_chunk.len() <= remaining_space {
-                full_new_content.push_str(&content_chunk);
-            } else {
-                full_new_content.push_str(&content_chunk[..remaining_space]);
-            }
-        }
-
-        // Scan this chunk for a limit. Since we are reading forwards, any limit
-        // found in a later chunk is newer than one from a previous chunk.
-        if let Some(limit) = crate::watcher::scan::scan_content_for_limit(&content_chunk) {
-            latest_limit = Some(limit);
-        }
-    }
-
-    Ok((full_new_content, total_bytes_read, latest_limit))
 }
 
 /// Handles the logic for when a lockout expires.

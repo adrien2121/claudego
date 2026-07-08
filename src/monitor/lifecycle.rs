@@ -1,14 +1,14 @@
 use super::helpers::WATCHER_MAX_RETRIES;
 use crate::logging::log_to_file;
-use notify::{RecommendedWatcher, RecursiveMode, Watcher};
-use std::sync::mpsc::{channel, Receiver};
+use notify::{Event, RecommendedWatcher, RecursiveMode, Result, Watcher};
 use std::thread;
 use std::time::Duration;
+use tokio::sync::mpsc::{self, Receiver};
 
 /// Bundles the OS watcher (must stay alive) with its event receiver.
 pub(super) struct WatcherHandle {
     pub(super) _watcher: RecommendedWatcher,
-    pub(super) rx: Receiver<Result<notify::Event, notify::Error>>,
+    pub(super) rx: Receiver<Result<Event>>,
 }
 
 /// Create a recursive file watcher on `~/.claude/projects`, retrying with
@@ -18,8 +18,14 @@ pub(super) fn create_watcher() -> Option<WatcherHandle> {
     let _ = std::fs::create_dir_all(&projects_root);
 
     for attempt in 0..WATCHER_MAX_RETRIES {
-        let (tx, rx) = channel();
-        match notify::recommended_watcher(tx) {
+        let (tx, rx) = mpsc::channel(32);
+        let event_handler = move |res: Result<Event>| {
+            // This closure is the EventHandler. It will be called from a sync context
+            // (notify's thread). We use `blocking_send` to send to the async channel.
+            // `.ok()` is used to ignore errors if the receiver has been dropped.
+            tx.blocking_send(res).ok();
+        };
+        match notify::recommended_watcher(event_handler) {
             Ok(mut watcher) => match watcher.watch(&projects_root, RecursiveMode::Recursive) {
                 Ok(()) => {
                     if attempt > 0 {

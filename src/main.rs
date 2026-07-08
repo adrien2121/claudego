@@ -33,7 +33,8 @@ struct Cli {
     command: Vec<String>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let _awake_guard = if cli.prevent_sleep {
@@ -57,5 +58,5 @@ fn main() -> Result<()> {
         cli::CommandSpec { program, args }
     };
 
-    app::run(cli.show_logs, command_spec)
+    app::run(cli.show_logs, command_spec).await
 }

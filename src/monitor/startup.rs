@@ -4,6 +4,7 @@ use crate::monitor::helpers::SCAN_CHUNK_SIZE;
 use crate::watcher::files as watcher_files;
 use crate::watcher::scan::InitialScanResult;
 use chrono::{DateTime, Local};
+use memchr;
 use std::fs::File;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::path::PathBuf;
@@ -43,7 +44,7 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
         // If we are not at the start of the file, the beginning of our buffer might
         // be a partial line. We save it for the next iteration.
         if read_start > 0 {
-            if let Some(first_newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+            if let Some(first_newline_pos) = memchr::memchr(b'\n', &buffer) {
                 carry_forward.extend_from_slice(&buffer[..first_newline_pos]);
                 content_to_scan = String::from_utf8_lossy(&buffer[first_newline_pos..]);
             } else {
