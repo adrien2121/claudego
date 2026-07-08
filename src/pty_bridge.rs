@@ -3,9 +3,10 @@ use crate::models::SharedAppState;
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{self, Read, Write};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -41,17 +42,17 @@ pub fn spawn_command_in_pty(command: CommandSpec) -> Result<PtySession> {
 
 pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppState) {
     thread::spawn(move || {
+        // Clone the atomic tracker once to avoid locking the state in the loop.
+        let activity_tracker = state.lock().unwrap().last_pty_activity.clone();
         let mut buf = [0u8; 1024];
         let mut stdout = io::stdout();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
             }
-
-            // Update the activity timestamp to signal that the PTY is busy.
-            if let Ok(mut app) = state.lock() {
-                app.last_pty_activity = Instant::now();
-            }
+            // Atomically update the activity timestamp without locking the main state.
+            let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
+            activity_tracker.store(now_nanos, Ordering::Relaxed);
 
             let _ = stdout.write_all(&buf[..n]);
             let _ = stdout.flush();

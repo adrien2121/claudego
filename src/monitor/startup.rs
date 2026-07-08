@@ -1,5 +1,6 @@
 use crate::logging::log_to_file;
 use crate::models::SharedAppState;
+use crate::monitor::helpers::SCAN_CHUNK_SIZE;
 use crate::watcher::files as watcher_files;
 use crate::watcher::scan::InitialScanResult;
 use chrono::{DateTime, Local};
@@ -8,10 +9,9 @@ use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-const INITIAL_SCAN_CHUNK_SIZE: u64 = 65_536; // 64 KiB
-
 /// Scans a single file by reading it backwards in chunks. This is memory-efficient
-/// and robustly finds the most recent rate-limit message, even in very large files.
+/// and robustly finds the most recent rate-limit message by correctly handling
+/// log lines that are split across chunk boundaries.
 fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
@@ -20,28 +20,54 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
         return Ok(InitialScanResult::NoLimitFound);
     }
 
-    let mut buffer = Vec::with_capacity(INITIAL_SCAN_CHUNK_SIZE as usize);
+    let mut buffer = Vec::with_capacity(SCAN_CHUNK_SIZE);
+    // `carry_forward` holds a partial line from the start of a chunk, to be
+    // prepended to the next chunk read (which is the preceding chunk in the file).
+    let mut carry_forward = Vec::new();
     let mut current_pos = file_size;
 
     while current_pos > 0 {
-        let read_start = current_pos.saturating_sub(INITIAL_SCAN_CHUNK_SIZE);
+        let read_start = current_pos.saturating_sub(SCAN_CHUNK_SIZE as u64);
         let read_len = (current_pos - read_start) as usize;
 
+        // Read the next chunk from the file.
         file.seek(SeekFrom::Start(read_start))?;
         buffer.resize(read_len, 0);
         file.read_exact(&mut buffer)?;
 
-        let content = String::from_utf8_lossy(&buffer);
+        // Prepend the partial line from the previous iteration to complete any split lines.
+        buffer.append(&mut carry_forward);
 
-        match crate::watcher::scan::scan_content_for_any_limit(&content) {
+        let content_to_scan: std::borrow::Cow<str>;
+
+        // If we are not at the start of the file, the beginning of our buffer might
+        // be a partial line. We save it for the next iteration.
+        if read_start > 0 {
+            if let Some(first_newline_pos) = buffer.iter().position(|&b| b == b'\n') {
+                carry_forward.extend_from_slice(&buffer[..first_newline_pos]);
+                content_to_scan = String::from_utf8_lossy(&buffer[first_newline_pos..]);
+            } else {
+                // The whole chunk has no newline, so it's all a partial line.
+                // We move the buffer's content to carry_forward for the next iteration.
+                // `swap` does this efficiently without a new allocation.
+                std::mem::swap(&mut carry_forward, &mut buffer);
+                current_pos = read_start;
+                continue; // Nothing to scan in this iteration.
+            }
+        } else {
+            // This is the first chunk of the file, so process everything.
+            content_to_scan = String::from_utf8_lossy(&buffer);
+        }
+
+        // We must use `scan_content_for_any_limit` to correctly stop at the
+        // first (most recent) limit, even if it's stale.
+        match crate::watcher::scan::scan_content_for_any_limit(&content_to_scan) {
             InitialScanResult::Active(limit) => return Ok(InitialScanResult::Active(limit)),
             InitialScanResult::Stale => return Ok(InitialScanResult::Stale),
-            InitialScanResult::NoLimitFound => {
-                // No limit found in this chunk. If we've already read the start of
-                // the file, we're done. Otherwise, continue to the previous chunk.
-                current_pos = read_start;
-            }
+            InitialScanResult::NoLimitFound => { /* Continue to the previous chunk */ }
         }
+
+        current_pos = read_start;
     }
 
     Ok(InitialScanResult::NoLimitFound)

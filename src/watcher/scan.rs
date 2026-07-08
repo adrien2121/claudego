@@ -15,38 +15,38 @@ pub(crate) enum InitialScanResult {
     NoLimitFound,
 }
 
+/// Scans content from the end and returns the result of the first (most recent)
+/// rate limit message found.
+fn scan_content_for_most_recent_limit(content: &str) -> RateLimitLine {
+    for line in content.lines().rev() {
+        let result = parse_rate_limit_line(line);
+        if !matches!(result, RateLimitLine::NoMatch) {
+            return result;
+        }
+    }
+    RateLimitLine::NoMatch
+}
+
 /// Scans string content from the end for the most recent rate limit message.
 ///
 /// # Returns
 /// `Option<(DateTime<Local>, String)>` - The rate limit target time and display string if an active limit is found.
 pub(crate) fn scan_content_for_limit(content: &str) -> Option<(DateTime<Local>, String)> {
-    // Iterate lines in reverse because we only care about the most recent limit.
-    for line in content.lines().rev() {
-        match parse_rate_limit_line(line) {
-            RateLimitLine::Active(limit) => return Some(limit),
-            // If we find a stale limit, we can stop. Any earlier limits are, by definition, also stale.
-            RateLimitLine::Stale => return None,
-            RateLimitLine::NoMatch => continue,
-        }
+    match scan_content_for_most_recent_limit(content) {
+        RateLimitLine::Active(limit) => Some(limit),
+        _ => None, // Stale or NoMatch are treated as no active limit.
     }
-
-    None
 }
 
 /// Scans content from the end, returning the status of the first rate limit message found.
 /// This is more comprehensive than `scan_content_for_limit` because it distinguishes
 /// between finding a stale limit and finding no limit at all.
 pub(crate) fn scan_content_for_any_limit(content: &str) -> InitialScanResult {
-    // Iterate lines in reverse because we only care about the most recent limit.
-    for line in content.lines().rev() {
-        match parse_rate_limit_line(line) {
-            RateLimitLine::Active(limit) => return InitialScanResult::Active(limit),
-            RateLimitLine::Stale => return InitialScanResult::Stale,
-            RateLimitLine::NoMatch => continue,
-        }
+    match scan_content_for_most_recent_limit(content) {
+        RateLimitLine::Active(limit) => InitialScanResult::Active(limit),
+        RateLimitLine::Stale => InitialScanResult::Stale,
+        RateLimitLine::NoMatch => InitialScanResult::NoLimitFound,
     }
-
-    InitialScanResult::NoLimitFound
 }
 
 /// Parses a single JSON line to check if it is a rate limit error.

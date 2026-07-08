@@ -86,7 +86,7 @@ fn handle_locked_wait(
     let now = Local::now();
     // Check if the lockout has expired.
     if now >= target {
-        runtime::handle_expiry(state, writer);
+        runtime::handle_expiry(state, writer, target);
         return WaitOutcome::ShouldContinue;
     }
 

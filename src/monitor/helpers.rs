@@ -12,6 +12,9 @@ pub(super) const PTY_BUSY_THRESHOLD: Duration = Duration::from_secs(2);
 /// How long to wait before re-checking if the PTY is busy.
 pub(super) const DEFER_SCAN_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Size of chunks to read from log files for scanning. 64 KiB.
+pub(super) const SCAN_CHUNK_SIZE: usize = 65_536;
+
 // Cooldown log cadence thresholds (seconds remaining → log interval).
 const VERY_FAR_THRESHOLD_SECS: u64 = 3 * 60 * 60; // > 3 h  → log every 1 h
 const FAR_THRESHOLD_SECS: u64 = 60 * 60; //       > 1 h  → every 30 m
