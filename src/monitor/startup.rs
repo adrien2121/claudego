@@ -2,8 +2,7 @@ use crate::logging::log_to_file;
 use crate::models::SharedAppState;
 use crate::monitor::helpers::SCAN_CHUNK_SIZE;
 use crate::watcher::files as watcher_files;
-use crate::watcher::scan::InitialScanResult;
-use chrono::{DateTime, Local};
+use crate::watcher::scan::{ActiveRateLimitInfo, InitialScanResult};
 use memchr;
 use std::fs::File;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
@@ -71,7 +70,7 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
 
         // We must use `scan_content_for_any_limit` to correctly stop at the
         // first (most recent) limit, even if it's stale.
-        match crate::watcher::scan::scan_content_for_any_limit(&content_to_scan) {
+        match crate::watcher::scan::scan_content_for_any_limit(content_to_scan) {
             InitialScanResult::Active(limit) => return Ok(InitialScanResult::Active(limit)),
             InitialScanResult::Stale => return Ok(InitialScanResult::Stale),
             InitialScanResult::NoLimitFound => { /* Continue to the previous chunk */ }
@@ -89,10 +88,13 @@ pub(super) fn initial_scan(state: &SharedAppState) {
     let initial_files = watcher_files::claude_projects_root()
         .map(|root| watcher_files::recent_session_logs(&root, SystemTime::UNIX_EPOCH))
         .unwrap_or_default();
-    let mut latest_limit: Option<(DateTime<Local>, String)> = None;
+    let mut latest_limit: Option<ActiveRateLimitInfo> = None;
 
     if !initial_files.is_empty() {
-        log_to_file(&format!("[Startup] Scanning {} initial session file(s).", initial_files.len()));
+        log_to_file(&format!(
+            "[Startup] Scanning {} initial session file(s).",
+            initial_files.len()
+        ));
     }
 
     for (path, _) in initial_files {
@@ -106,7 +108,10 @@ pub(super) fn initial_scan(state: &SharedAppState) {
 
         match scan_file_backwards(&path) {
             Ok(InitialScanResult::Active(limit)) => {
-                if latest_limit.as_ref().map_or(true, |(t, _)| &limit.0 > t) {
+                if latest_limit
+                    .as_ref()
+                    .is_none_or(|l| limit.target_time > l.target_time)
+                {
                     latest_limit = Some(limit);
                 }
             }
@@ -117,17 +122,32 @@ pub(super) fn initial_scan(state: &SharedAppState) {
                 // No limit found in the entire file.
             }
             Err(e) => {
-                log_to_file(&format!("[Startup] Error scanning file {}: {}", path.display(), e));
+                log_to_file(&format!(
+                    "[Startup] Error scanning file {}: {}",
+                    path.display(),
+                    e
+                ));
             }
         }
     }
 
     // Add a blank line for readability after the initial scan section.
     log_to_file("");
-    if let Some((target_time, time_str)) = latest_limit {
-        log_to_file(&format!("[LOCKOUT ON STARTUP] Rate limit found. Target: {}", time_str));
+    if let Some(limit) = latest_limit {
+        log_to_file("  [MATCH] Active 'rate_limit' row found on startup scan.");
+        log_to_file(&format!(
+            "  [Extracted Text] Raw Limit Message: \"{}\"",
+            limit.raw_message
+        ));
+        log_to_file(&format!(
+            "  [SUCCESS] Valid active limit confirmed! Resets: {}",
+            limit.display_str
+        ));
+        log_to_file(&format!(
+            "[LOCKOUT ON STARTUP] Rate limit found. Target: {}",
+            limit.display_str
+        ));
         let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
-        app.is_sleeping = true;
-        app.lockout.target_time = Some(target_time);
+        app.lockout_target_time = Some(limit.target_time);
     }
 }

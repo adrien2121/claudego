@@ -1,15 +1,7 @@
-mod app;
-mod cli;
-mod logging;
-mod models;
-mod monitor;
-mod pty_bridge;
-mod terminal;
-mod time_format;
-mod watcher;
-
 use anyhow::Result;
 use clap::Parser;
+use claudego::app;
+use claudego::cli::CommandSpec;
 use keepawake::Builder;
 
 /// A fire-and-forget wrapper for the claude CLI that automatically handles rate limits.
@@ -50,12 +42,12 @@ async fn main() -> Result<()> {
 
     let command_spec = if cli.command.is_empty() {
         // If no command is provided, default to running 'claude' by itself.
-        cli::CommandSpec { program: "claude".to_string(), args: vec![] }
+        CommandSpec::default_claude()
     } else {
         let mut iter = cli.command.into_iter();
         let program = iter.next().unwrap(); // Safe due to is_empty check
         let args = iter.collect();
-        cli::CommandSpec { program, args }
+        CommandSpec { program, args }
     };
 
     app::run(cli.show_logs, command_spec).await

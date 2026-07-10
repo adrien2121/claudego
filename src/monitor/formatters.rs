@@ -1,4 +1,3 @@
-use serde_json;
 use std::io::Write;
 
 /// Creates a formatted preview of new file content as a string.
@@ -10,10 +9,7 @@ pub(super) fn create_content_preview(new_content: &str) -> String {
 }
 
 /// Helper that writes a formatted preview of new file content to a writer.
-fn write_preview_to_buffer(
-    writer: &mut dyn Write,
-    new_content: &str,
-) -> std::io::Result<()> {
+fn write_preview_to_buffer(writer: &mut dyn Write, new_content: &str) -> std::io::Result<()> {
     const MAX_LINES_TO_LOG: usize = 5;
     let lines: Vec<_> = new_content.lines().collect();
     let total_lines = lines.len();
@@ -24,19 +20,6 @@ fn write_preview_to_buffer(
             continue;
         }
 
-        if trimmed_line.starts_with('{') && trimmed_line.ends_with('}') {
-            if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed_line) {
-                let pretty_json =
-                    serde_json::to_string_pretty(&value).unwrap_or_else(|_| trimmed_line.to_string());
-
-                // Write the indented block line by line
-                for json_line in pretty_json.lines() {
-                    writeln!(writer, "    {}", json_line)?;
-                }
-                continue;
-            }
-        }
-        // Not a valid/parsable JSON object, just write the line as-is.
         writeln!(writer, "    > {}", line.trim_end())?;
     }
 
@@ -49,4 +32,19 @@ fn write_preview_to_buffer(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::create_content_preview;
+
+    #[test]
+    fn preview_keeps_json_compact() {
+        let preview = create_content_preview(r#"{"type":"event","nested":{"value":1}}"#);
+
+        assert_eq!(
+            preview,
+            "    > {\"type\":\"event\",\"nested\":{\"value\":1}}\n"
+        );
+    }
 }

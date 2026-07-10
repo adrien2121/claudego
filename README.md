@@ -1,31 +1,16 @@
 # claudego
 
-`claudego` automatically sends 'continue' to your active Claude Code CLI session when your usage limit has been restored. If you are running a long session, you no longer need to manually jumpstart the conversation once your limit is reset.
+`claudego` automatically sends `continue` to your active Claude CLI session when your usage limit has been restored. If you are running a long session, you no longer need to manually jumpstart the conversation once your limit is reset.
 
 ## What it Does
 
 `claudego` is a "fire-and-forget" wrapper for the `claude` CLI. It runs your command as usual, but works silently in the background to monitor for rate-limit errors across all of Claude's session files on your system.
 
-When it detects a rate limit (e.g., "Please try again in 5 hours."), it calculates the reset time and waits. Once the cooldown is over, it automatically injects a `continue` command into your session, resuming the work without intervention.
+When it detects a rate limit (e.g., "Please try again in 5 hours."), it calculates the reset time and waits. Once the cooldown is over, it automatically injects a `continue` command into your session, resuming the work without your intervention.
 
-The intelligent polling mechanism is designed to be efficient: it checks infrequently when the reset is hours away and more often as the time gets closer. For a detailed view of this process, you can use the `--show-logs` flag.
+The monitoring process is designed to be highly efficient and non-intrusive. For a detailed view of its operations, you can use the `--show-logs` flag.
 
-## How it Works
-
-`claudego` is built in Rust.
-
-1.  **Pseudo-Terminal (PTY):** It spawns the `claude` command within a PTY. This allows `claudego` to act as a terminal, capturing all output from `claude` and enabling it to send input (like the `continue` command) programmatically.
-
-2.  **Efficient Log Monitoring:** It asynchronously watches Claude's session log directories (`~/.claude/projects/`). When a `.jsonl` log file is modified, `claudego` performs an efficient scan.
-
-3.  **Intelligent Rate-Limit Detection:** Instead of reading the entire file, it scans backwards from the end to quickly find the newest entries. It looks for specific JSON log lines where `{"error": "rate_limit"}` is present. It then parses the human-readable message within that log entry (e.g., `"You've hit your session limit · resets 9:40pm..."`) to extract the precise reset time.
-
-4.  **Asynchronous Waiting:** Once a rate limit is detected, `claudego` calculates the exact reset time. It then enters an efficient, asynchronous wait state. The polling interval is adaptive: it starts long and shortens as the reset time approaches to minimize resource usage.
-
-5.  **Automatic Resumption:** When the cooldown period ends, `claudego` injects the `continue\n` command into the PTY of the specific `claude` process it is managing. This is equivalent to you typing `continue` in that terminal window. The command will apply to whichever conversation is currently active within your `claude` session, even if you've used commands like `/resume` to switch contexts.
-
-
-When you hit a rate limit, you will see messages like this in the `claudego-logs` output:
+When you hit a rate limit, you will see a message like this in your terminal:
 
 ```
 You've reached your usage limit. Please try again in 5 hours.
@@ -46,9 +31,12 @@ claudego
 claudego -- claude --model opus "Summarize this document for me"
 ```
 
-It is recommended to run `claudego` paired with a tool to prevent sleep mode for long sessions.
+**Preventing System Sleep:**
+
+For long-running sessions that might span several hours, it's crucial to prevent your computer from going to sleep. `claudego` has a built-in feature for this. Use the `-p` or `--prevent-sleep` flag to keep your system awake.
+
 ```bash
-claudego -- caffeinate -s claude
+claudego -p -- claude
 ```
 
 ### Viewing Logs (`claudego-logs`)
@@ -78,3 +66,13 @@ You can install `claudego` with this one-line command in PowerShell. This will d
 ```powershell
 iwr https://raw.githubusercontent.com/adrien2121/claudego/main/install.ps1 -useb | iex
 ```
+
+## Technical Details
+
+`claudego` employs an efficient, two-phase process to monitor for rate-limit messages without impacting system performance.
+
+1.  **Initial Scan:** On startup, the tool performs a fast, memory-efficient scan of existing Claude session logs. It reads files *backwards* from the end in small chunks, stopping as soon as it finds the most recent rate-limit message.
+
+2.  **Runtime Monitoring:** After the initial scan, `claudego` uses an OS-native file system watcher to monitor for changes. When a log file is updated, it uses memory-mapping to read only the new data. This process is extremely fast and has a low overhead.
+
+To avoid performance issues, the monitor will temporarily pause its scanning activities if it detects that the `claude` CLI is actively streaming a response. This ensures that `claudego`'s background I/O does not interfere with the user's interactive session.

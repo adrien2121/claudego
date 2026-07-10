@@ -1,12 +1,9 @@
 use crate::cli::CommandSpec;
-use crate::models::SharedAppState;
+use crate::models::{mark_output_activity, SharedAppState};
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{self, Read, Write};
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tokio::task;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -41,18 +38,16 @@ pub fn spawn_command_in_pty(command: CommandSpec) -> Result<PtySession> {
 }
 
 pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppState) {
-    task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         // Clone the atomic tracker once to avoid locking the state in the loop.
-        let activity_tracker = state.lock().unwrap().last_pty_activity.clone();
+        let activity_tracker = state.lock().unwrap().last_output_activity.clone();
         let mut buf = [0u8; 1024];
         let mut stdout = io::stdout();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
             }
-            // Atomically update the activity timestamp without locking the main state.
-            let now_nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64;
-            activity_tracker.store(now_nanos, Ordering::Relaxed);
+            mark_output_activity(&activity_tracker);
 
             let _ = stdout.write_all(&buf[..n]);
             let _ = stdout.flush();
@@ -61,7 +56,7 @@ pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppSta
 }
 
 pub fn spawn_input_writer(writer: SharedPtyWriter) {
-    task::spawn_blocking(move || {
+    std::thread::spawn(move || {
         let mut buf = [0u8; 1024];
         let mut stdin = io::stdin();
         while let Ok(n) = stdin.read(&mut buf) {
@@ -80,12 +75,12 @@ pub fn spawn_input_writer(writer: SharedPtyWriter) {
 
 pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: TerminalSize) {
     #[cfg(unix)]
-    task::spawn_blocking(move || {
+    std::thread::spawn(move || {
         use signal_hook::consts::SIGWINCH;
         use signal_hook::iterator::Signals;
 
         let mut current_size = initial_size;
-        if let Ok(mut signals) = Signals::new(&[SIGWINCH]) {
+        if let Ok(mut signals) = Signals::new([SIGWINCH]) {
             for _ in signals.forever() {
                 if let Ok(new_size) = crossterm::terminal::size() {
                     if new_size != current_size {
@@ -98,7 +93,7 @@ pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: Term
     });
 
     #[cfg(not(unix))]
-    task::spawn(async move {
+    tokio::spawn(async move {
         let mut current_size = initial_size;
         loop {
             tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
@@ -111,7 +106,6 @@ pub fn spawn_resize_poller(master: Box<dyn MasterPty + Send>, initial_size: Term
         }
     });
 }
-
 
 fn build_command(command: CommandSpec) -> CommandBuilder {
     let mut cmd = CommandBuilder::new(command.program);

@@ -1,14 +1,13 @@
 use crate::logging::{log_to_file, log_with_content};
-use crate::models::SharedAppState;
+use crate::models::{output_is_hot, SharedAppState};
 use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
-use crate::pty_bridge::SharedPtyWriter;
+use crate::resume::ResumeTarget;
 use chrono::{DateTime, Local};
 use memmap2;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tokio::time::{sleep, Duration};
+use std::time::Instant;
+use tokio::time::sleep;
 
 /// To prevent unbounded memory usage when a log file has a very large amount of new
 /// content, we cap the content collected for logging to 1 MiB.
@@ -30,24 +29,10 @@ pub(super) async fn scan_and_update_state(
     // which is a direct cause of the "stalled stream" error.
     let activity_tracker = {
         let app = state.lock().unwrap();
-        app.last_pty_activity.clone()
+        app.last_output_activity.clone()
     };
     loop {
-        let last_activity_ns = activity_tracker.load(Ordering::Relaxed);
-        let pty_is_busy = if last_activity_ns == 0 {
-            // If the timestamp is 0, it's uninitialized. Assume not busy.
-            false
-        } else {
-            // Check if the duration since the last activity is within our threshold.
-            let now_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos() as u64;
-            let elapsed_ns = now_ns.saturating_sub(last_activity_ns);
-            Duration::from_nanos(elapsed_ns) < PTY_BUSY_THRESHOLD
-        };
-
-        if pty_is_busy {
+        if output_is_hot(&activity_tracker, PTY_BUSY_THRESHOLD) {
             log_to_file(&format!(
                 "Claude is currently streaming output. Deferring file scan for {:?}.",
                 DEFER_SCAN_INTERVAL,
@@ -59,10 +44,7 @@ pub(super) async fn scan_and_update_state(
     }
 
     // Log which files are being scanned.
-    let path_names: Vec<_> = paths
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect();
+    let path_names: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
     log_to_file(&format!(
         "[File Event] Triggering scan. Changed files:\n{}",
         path_names.join("\n")
@@ -73,16 +55,24 @@ pub(super) async fn scan_and_update_state(
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .file_size_cache
-            .get(&path).copied().unwrap_or(0); // If not in cache, this is the first time we see it.
+            .get(&path)
+            .copied()
+            .unwrap_or(0); // If not in cache, this is the first time we see it.
 
-        let mtime_before = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
-        let new_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(old_size);
+        let mtime_before = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
+        let new_size = std::fs::metadata(&path)
+            .map(|m| m.len())
+            .unwrap_or(old_size);
 
         if new_size <= old_size {
             continue;
         }
 
-        let mtime_after = std::fs::metadata(&path).ok().and_then(|m| m.modified().ok());
+        let mtime_after = std::fs::metadata(&path)
+            .ok()
+            .and_then(|m| m.modified().ok());
 
         // If the file was modified during our read, we abort processing for this cycle.
         // The file watcher has already picked up the new change, which will trigger a
@@ -113,69 +103,139 @@ pub(super) async fn scan_and_update_state(
                             Ok(scan_str) => {
                                 // 1. Generate a preview for logging. The preview should only
                                 //    show the *truly new* content, not the overlap.
-                                let new_content_offset = old_size.saturating_sub(scan_start) as usize;
+                                let new_content_offset =
+                                    old_size.saturating_sub(scan_start) as usize;
                                 if new_content_offset < scan_str.len() {
                                     let new_content_for_preview = &scan_str[new_content_offset..];
-                                    let preview_len = new_content_for_preview.len().min(MAX_PREVIEW_CONTENT_SIZE);
+                                    let preview_len =
+                                        new_content_for_preview.len().min(MAX_PREVIEW_CONTENT_SIZE);
                                     let content_preview =
                                         crate::monitor::formatters::create_content_preview(
                                             &new_content_for_preview[..preview_len],
                                         );
-                                    log_with_content(&format!("[File Content] New data in {}:", path.display()), content_preview);
+                                    log_with_content(
+                                        &format!("[File Content] New data in {}:", path.display()),
+                                        content_preview,
+                                    );
                                 }
 
                                 // 2. Scan the entire slice (including overlap) for a rate limit.
                                 crate::watcher::scan::scan_content_for_limit(scan_str)
                             }
                             Err(_) => {
-                                log_to_file(&format!("[Scan Warning] Invalid UTF-8 in new content of {}. Skipping.", path.display()));
+                                log_to_file(&format!(
+                                    "[Scan Warning] Invalid UTF-8 in new content of {}. Skipping.",
+                                    path.display()
+                                ));
                                 None
                             }
                         }
                     }
                     Err(e) => {
-                        log_to_file(&format!("[Scan Error] Failed to mmap {}: {}", path.display(), e));
+                        log_to_file(&format!(
+                            "[Scan Error] Failed to mmap {}: {}",
+                            path.display(),
+                            e
+                        ));
                         None
                     }
                 }
             }
             Err(e) => {
-                log_to_file(&format!("[Scan Error] Failed to open {}: {}", path.display(), e));
+                log_to_file(&format!(
+                    "[Scan Error] Failed to open {}: {}",
+                    path.display(),
+                    e
+                ));
                 None
             }
         };
 
         // --- Update State ---
-        let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
-        app.file_size_cache.insert(path, new_size);
+        {
+            let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
+            app.file_size_cache.insert(path, new_size);
+        }
 
-        if let Some((target_time, time_str)) = limit_opt {
-            log_to_file(&format!("[LOCKOUT DETECTED] Rate limit hit! Target: {}", time_str));
-            app.is_sleeping = true;
-            app.lockout.target_time = Some(target_time);
+        if let Some(limit_info) = limit_opt {
+            // These logs were previously inside `watcher::scan::parse_rate_limit_line`.
+            // Moving them here makes the parser a pure function.
+            log_to_file("  [MATCH] Active 'rate_limit' row found! Parsing contents...");
+            log_to_file(&format!(
+                "  [Extracted Text] Raw Limit Message: \"{}\"",
+                limit_info.raw_message
+            ));
+            log_to_file(&format!(
+                "  [SUCCESS] Valid active limit confirmed! Resets: {}",
+                limit_info.display_str
+            ));
+            record_lockout(state, limit_info, "file watcher");
             *next_log_time = Instant::now();
         }
     }
 }
 
+pub(super) fn record_lockout(
+    state: &SharedAppState,
+    limit_info: crate::watcher::scan::ActiveRateLimitInfo,
+    source: &str,
+) {
+    log_to_file(&format!(
+        "[LOCKOUT DETECTED] Rate limit hit from {source}. Target: {}",
+        limit_info.display_str
+    ));
+    let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
+    app.lockout_revision = app.lockout_revision.wrapping_add(1);
+    app.lockout_target_time = Some(limit_info.target_time);
+}
+
 /// Handles the logic for when a lockout expires.
-pub(super) fn handle_expiry(state: &SharedAppState, writer: &SharedPtyWriter, expired_target: DateTime<Local>) {
+pub(super) fn handle_expiry(
+    state: &SharedAppState,
+    resume_target: &ResumeTarget,
+    expired_target: DateTime<Local>,
+) {
     log_to_file("[Trigger] Reset time reached. Injecting 'continue' command…");
-    {
-        let mut w = writer.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = w.write_all(b"continue\r");
-        let _ = w.flush();
+    match resume_target.resume() {
+        Ok(()) => log_to_file("[System] Resume command sent."),
+        Err(error) => log_to_file(&format!("[Resume Error] {error}")),
     }
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     // Atomically check and set: only clear the lockout if it's the one we just handled.
     // This prevents a race condition where a new lockout is detected right as an old one expires.
-    if s.lockout.target_time == Some(expired_target) {
-        s.is_sleeping = false;
-        s.lockout.target_time = None;
+    if s.lockout_target_time == Some(expired_target) {
+        s.lockout_target_time = None;
         s.file_size_cache.clear();
         log_to_file("[System] Resuming passive file monitoring.");
     } else {
         // Another lockout was set in the meantime. Don't clear it.
         log_to_file("[System] Expiry handled, but a newer lockout has already been detected. State not cleared.");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::record_lockout;
+    use crate::models::AppState;
+    use crate::watcher::scan::ActiveRateLimitInfo;
+    use chrono::{Duration, Local};
+    use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn stream_lockout_updates_shared_state() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let target = Local::now() + Duration::minutes(30);
+
+        record_lockout(
+            &state,
+            ActiveRateLimitInfo {
+                target_time: target,
+                display_str: "5:30pm".to_string(),
+                raw_message: "Claude limit reached; resets 5:30pm".to_string(),
+            },
+            "stream-json",
+        );
+
+        assert_eq!(state.lock().unwrap().lockout_target_time, Some(target));
     }
 }

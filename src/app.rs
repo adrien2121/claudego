@@ -1,13 +1,16 @@
+use crate::cli::{select_runner, CommandSpec, RunnerKind};
 use crate::logging;
 use crate::models::AppState;
 use crate::monitor;
 use crate::pty_bridge;
+use crate::resume::ResumeTarget;
+use crate::resume::StreamResumeCommand;
+use crate::stream_json;
 use crate::terminal::RawModeGuard;
 use anyhow::Result;
 
 use std::sync::{Arc, Mutex};
-
-use crate::cli::CommandSpec;
+use tokio::sync::mpsc;
 
 pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     // Unconditionally start logging
@@ -29,21 +32,31 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
         {
             open_logs_terminal();
         } else {
-            println!("[System] Warning: Live log viewer failed to start (logger did not become ready).");
+            println!(
+                "[System] Warning: Live log viewer failed to start (logger did not become ready)."
+            );
         }
     }
 
-    let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
-    let _guard = RawModeGuard::init()?;
+    match select_runner(&command_spec) {
+        RunnerKind::PtyInteractive => {
+            let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
+            let _guard = RawModeGuard::init()?;
 
-    pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
-    pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
-    pty_bridge::spawn_resize_poller(session.master, session.initial_size);
-    monitor::spawn_lockout_monitor(state, Arc::clone(&session.writer));
+            pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
+            pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
+            pty_bridge::spawn_resize_poller(session.master, session.initial_size);
+            monitor::spawn_lockout_monitor(state, ResumeTarget::Pty(Arc::clone(&session.writer)));
 
-    // Move the blocking `wait` call to a dedicated thread to avoid blocking the tokio runtime.
-    let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
-    let _ = child_wait_handle.await??;
+            let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
+            let _ = child_wait_handle.await??;
+        }
+        RunnerKind::StreamJsonPrint => {
+            let (resume_tx, resume_rx) = mpsc::unbounded_channel::<StreamResumeCommand>();
+            monitor::spawn_lockout_monitor(state.clone(), ResumeTarget::StreamJson(resume_tx));
+            stream_json::run_stream_json_print(command_spec, state, resume_rx).await?;
+        }
+    }
 
     logging::log_to_file("[System] Child process exited. Shutting down.");
     // Gracefully shut down the logger, ensuring all messages are flushed.

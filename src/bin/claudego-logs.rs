@@ -2,14 +2,8 @@ use anyhow::{Context, Result};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::io::{BufRead, BufReader};
 use std::net::{SocketAddr, TcpStream};
-use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
-
-/// Returns the path to the file that stores the port number for the live log server.
-fn port_path() -> PathBuf {
-    std::env::temp_dir().join("claudego.port")
-}
 
 fn main() -> Result<()> {
     println!("Waiting for claudego session to start...");
@@ -27,8 +21,8 @@ fn main() -> Result<()> {
         // If we can't connect, set up a watcher on the port file's parent directory.
         // This is far more efficient than polling the file in a loop.
         let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(tx)
-            .context("Failed to create filesystem watcher")?;
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(tx).context("Failed to create filesystem watcher")?;
 
         // Watch the temp directory for the creation of our port file.
         watcher
@@ -43,7 +37,9 @@ fn main() -> Result<()> {
                     // then try connecting.
                     thread::sleep(Duration::from_millis(50));
                     if try_connect_and_stream().is_ok() {
-                        println!("\nConnection to claudego process lost. Waiting for it to restart...");
+                        println!(
+                            "\nConnection to claudego process lost. Waiting for it to restart..."
+                        );
                     }
                     // Break the inner `for` loop to re-establish the watcher.
                     break;
@@ -66,7 +62,8 @@ fn is_relevant_port_file_event(event: &notify::Event) -> bool {
 /// Attempts to read the port file, connect to the TCP server, and stream logs.
 /// Returns an error if any step fails, allowing the caller to retry.
 fn try_connect_and_stream() -> Result<()> {
-    let port_str = std::fs::read_to_string(port_path()).context("Port file not found or unreadable")?;
+    let port_str = std::fs::read_to_string(claudego::paths::port_path())
+        .context("Port file not found or unreadable")?;
     let port = port_str
         .trim()
         .parse::<u16>()

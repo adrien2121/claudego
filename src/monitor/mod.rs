@@ -1,6 +1,6 @@
 use crate::logging::log_to_file;
 use crate::models::SharedAppState;
-use crate::pty_bridge::SharedPtyWriter;
+use crate::resume::ResumeTarget;
 use crate::time_format::format_duration;
 use chrono::Local;
 use std::time::Instant;
@@ -22,7 +22,7 @@ mod startup;
 use lifecycle::WatcherHandle;
 
 /// Spawns a dedicated thread to monitor Claude log files for rate limit lockouts.
-pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
+pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget) {
     tokio::spawn(async move {
         // ── 1. Initial full scan (I/O outside lock) ───────────────────
         startup::initial_scan(&state);
@@ -40,15 +40,14 @@ pub fn spawn_lockout_monitor(state: SharedAppState, writer: SharedPtyWriter) {
                 state
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .lockout
-                    .target_time
+                    .lockout_target_time
             };
 
             if let Some(target) = lockout_target {
                 // --- Lockout is ACTIVE ---
                 let now = Local::now();
                 if now >= target {
-                    runtime::handle_expiry(&state, &writer, target);
+                    runtime::handle_expiry(&state, &resume_target, target);
                     continue; // Re-evaluate state immediately
                 }
 
@@ -110,8 +109,18 @@ async fn handle_event_result(
             } else {
                 // If recovery fails, we can't do much more. The task will exit.
                 // In a real-world robust scenario, this might try to panic and restart the process.
-                log_to_file("[Watcher Error] CRITICAL: Watcher recovery failed. Monitoring has stopped.");
+                log_to_file(
+                    "[Watcher Error] CRITICAL: Watcher recovery failed. Monitoring has stopped.",
+                );
             }
         }
     }
+}
+
+pub fn record_lockout(
+    state: &SharedAppState,
+    limit_info: crate::watcher::scan::ActiveRateLimitInfo,
+    source: &str,
+) {
+    runtime::record_lockout(state, limit_info, source);
 }

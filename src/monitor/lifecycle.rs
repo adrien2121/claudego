@@ -1,8 +1,8 @@
 use super::helpers::WATCHER_MAX_RETRIES;
 use crate::logging::log_to_file;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result, Watcher};
-use tokio::time::{sleep, Duration};
 use tokio::sync::mpsc::{self, Receiver};
+use tokio::time::{sleep, Duration};
 
 /// Bundles the OS watcher (must stay alive) with its event receiver.
 pub(super) struct WatcherHandle {
