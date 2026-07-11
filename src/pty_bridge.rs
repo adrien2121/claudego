@@ -41,8 +41,9 @@ pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppSta
     tokio::task::spawn_blocking(move || {
         // Clone the atomic tracker once to avoid locking the state in the loop.
         let activity_tracker = state.lock().unwrap().last_output_activity.clone();
-        let mut buf = [0u8; 1024];
-        let mut stdout = io::stdout();
+        let mut buf = [0u8; 64 * 1024];
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
         while let Ok(n) = reader.read(&mut buf) {
             if n == 0 {
                 break;
