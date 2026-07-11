@@ -328,6 +328,7 @@ fn run_scenario(
     outcome
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_scenario(
     scenario: Scenario,
     child: &mut dyn Child,
