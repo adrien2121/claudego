@@ -19,7 +19,7 @@ Host: macOS 15.6.1; arm64; rustc 1.96.1 (31fca3adb 2026-06-26)
 
 commit: e7b14b2a0b613a11c54dbdf8dd59ab7b1a374abd
 
-Another `claudego` process must not run concurrently because the logger files are process-global.
+Benchmark logger evidence is isolated per run. Stop other `claudego` processes before benchmarking because competing work invalidates performance comparisons.
 
 Baseline
 

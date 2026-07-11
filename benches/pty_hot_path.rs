@@ -88,6 +88,19 @@ impl Drop for ScratchDir {
     }
 }
 
+struct LoggerPaths {
+    tmp_dir: PathBuf,
+    log: PathBuf,
+    port: PathBuf,
+}
+
+fn logger_paths(run_dir: &Path) -> LoggerPaths {
+    let tmp_dir = run_dir.join("tmp");
+    let log = tmp_dir.join("claudego.log");
+    let port = tmp_dir.join("claudego.port");
+    LoggerPaths { tmp_dir, log, port }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("pty_hot_path: {error}");
@@ -169,6 +182,30 @@ fn helper_self_check() -> BenchResult<()> {
     if nearest_rank_p99(&mut gaps) != Duration::from_millis(100) {
         return Err(failure("p99 self-check failed"));
     }
+
+    let first = logger_paths(Path::new("first-run"));
+    let second = logger_paths(Path::new("second-run"));
+    for paths in [&first, &second] {
+        if paths.log.parent() != Some(paths.tmp_dir.as_path())
+            || paths.port.parent() != Some(paths.tmp_dir.as_path())
+        {
+            return Err(failure("logger paths are not children of run-local tmp"));
+        }
+    }
+    if first.log == second.log || first.port == second.port {
+        return Err(failure("different runs share logger paths"));
+    }
+    let global_log = global_log_path();
+    let global_port = global_port_path();
+    if first.log == global_log
+        || second.log == global_log
+        || first.port == global_port
+        || second.port == global_port
+    {
+        return Err(failure(
+            "run-local logger paths equal global preflight paths",
+        ));
+    }
     Ok(())
 }
 
@@ -218,15 +255,18 @@ fn run_scenario(
 ) -> BenchResult<RunMetrics> {
     let count_path = run_dir.join("expected-count");
     let gate_path = run_dir.join("flood-gate");
+    let logger_paths = logger_paths(run_dir);
     let session_path = if scenario.uses_monitor() {
+        fs::create_dir(&logger_paths.tmp_dir).map_err(|error| {
+            failure(format!(
+                "create run-local logger directory {}: {error}",
+                logger_paths.tmp_dir.display()
+            ))
+        })?;
         Some(prepare_monitor_home(run_dir)?)
     } else {
         None
     };
-
-    if scenario.uses_monitor() {
-        reset_global_log_files();
-    }
 
     let command = if scenario == Scenario::Direct {
         let mut command = CommandBuilder::new(benchmark_exe);
@@ -253,11 +293,8 @@ fn run_scenario(
                 .ok_or_else(|| failure("non-UTF-8 gate path"))?,
         ]);
         let home = run_dir.join("home");
-        command.env(
-            "HOME",
-            home.to_str()
-                .ok_or_else(|| failure("non-UTF-8 benchmark HOME"))?,
-        );
+        command.env("HOME", &home);
+        command.env("TMPDIR", &logger_paths.tmp_dir);
         command
     };
 
@@ -282,6 +319,7 @@ fn run_scenario(
         session_path.as_deref(),
         &gate_path,
         &count_path,
+        &logger_paths,
         deadline,
     );
     if outcome.is_err() {
@@ -297,10 +335,11 @@ fn finish_scenario(
     session_path: Option<&Path>,
     gate_path: &Path,
     count_path: &Path,
+    logger_paths: &LoggerPaths,
     deadline: Instant,
 ) -> BenchResult<RunMetrics> {
     if scenario.uses_monitor() {
-        let log_rx = start_log_stream(deadline)?;
+        let log_rx = start_log_stream(&logger_paths.port, deadline)?;
         wait_for_log(&log_rx, WATCHER_READY_LOG, deadline)?;
 
         if scenario == Scenario::ScanDeferred {
@@ -329,8 +368,12 @@ fn finish_scenario(
     verify_expected_count(count_path, metrics.verified_bytes)?;
 
     if scenario.uses_monitor() {
-        let logs = fs::read_to_string(global_log_path())
-            .map_err(|error| failure(format!("read claudego log: {error}")))?;
+        let logs = fs::read_to_string(&logger_paths.log).map_err(|error| {
+            failure(format!(
+                "read claudego log {}: {error}",
+                logger_paths.log.display()
+            ))
+        })?;
         if !logs.contains(WATCHER_READY_LOG) {
             return Err(failure("persistent log is missing watcher readiness"));
         }
@@ -504,7 +547,8 @@ fn verify_expected_count(count_path: &Path, verified_bytes: u64) -> BenchResult<
 }
 
 fn ensure_no_active_claudego() -> BenchResult<()> {
-    if let Some(address) = logger_address() {
+    let global_port = global_port_path();
+    if let Some(address) = logger_address(&global_port) {
         if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
             return Err(failure(
                 "another claudego logger is active; stop it before benchmarking",
@@ -528,14 +572,14 @@ fn global_port_path() -> PathBuf {
     std::env::temp_dir().join("claudego.port")
 }
 
-fn logger_address() -> Option<SocketAddr> {
-    let port = fs::read_to_string(global_port_path()).ok()?;
+fn logger_address(port_path: &Path) -> Option<SocketAddr> {
+    let port = fs::read_to_string(port_path).ok()?;
     format!("127.0.0.1:{}", port.trim()).parse().ok()
 }
 
-fn start_log_stream(deadline: Instant) -> BenchResult<Receiver<String>> {
+fn start_log_stream(port_path: &Path, deadline: Instant) -> BenchResult<Receiver<String>> {
     loop {
-        if let Some(address) = logger_address() {
+        if let Some(address) = logger_address(port_path) {
             if let Ok(stream) = TcpStream::connect_timeout(&address, Duration::from_millis(100)) {
                 let (tx, rx) = mpsc::channel();
                 let _log_thread = thread::spawn(move || {
@@ -552,7 +596,10 @@ fn start_log_stream(deadline: Instant) -> BenchResult<Receiver<String>> {
             }
         }
         if Instant::now() >= deadline {
-            return Err(failure("logger did not become reachable"));
+            return Err(failure(format!(
+                "logger did not become reachable via {}",
+                port_path.display()
+            )));
         }
         thread::sleep(POLL_INTERVAL);
     }
