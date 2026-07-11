@@ -7,7 +7,7 @@
 
 use portable_pty::{Child, CommandBuilder, ExitStatus, NativePtySystem, PtySize, PtySystem};
 use std::error::Error;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -307,7 +307,7 @@ fn finish_scenario(
             let event_at = Instant::now();
             let session_path =
                 session_path.ok_or_else(|| failure("missing deferred scenario session path"))?;
-            let mut session = OpenOptions::new().append(true).open(session_path)?;
+            let mut session = File::create(session_path)?;
             session.write_all(
                 b"{\"type\":\"benchmark\",\"message\":\"synthetic non-limit event\"}\n",
             )?;
@@ -353,10 +353,6 @@ fn prepare_monitor_home(run_dir: &Path) -> BenchResult<PathBuf> {
         .parent()
         .ok_or_else(|| failure("session path has no parent"))?;
     fs::create_dir_all(parent)?;
-    fs::write(
-        &session_path,
-        b"{\"type\":\"benchmark\",\"message\":\"baseline\"}\n",
-    )?;
     Ok(session_path)
 }
 
