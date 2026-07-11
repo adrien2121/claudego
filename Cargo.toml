@@ -22,3 +22,7 @@ memmap2 = "0.9"
 
 [target."cfg(unix)".dependencies]
 signal-hook = "0.4.4"
+
+[[bench]]
+name = "pty_hot_path"
+harness = false
