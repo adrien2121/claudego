@@ -343,15 +343,52 @@ mod tests {
     use crate::models::{output_is_hot, AppState};
     use crate::watcher::scan::ActiveRateLimitInfo;
     use chrono::{Duration as ChronoDuration, Local};
+    use std::collections::VecDeque;
+    use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use tokio::io::{AsyncRead, ReadBuf};
     use tokio::sync::mpsc;
+
+    struct FragmentedReader {
+        chunks: VecDeque<Vec<u8>>,
+    }
+
+    impl FragmentedReader {
+        fn new(chunks: &[&[u8]]) -> Self {
+            Self {
+                chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+            }
+        }
+    }
+
+    impl AsyncRead for FragmentedReader {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                buf.put_slice(&chunk);
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn invalid_json_is_reported_without_failing_raw_output() {
         assert!(matches!(
             parse_stream_line("not json"),
             StreamLineResult::InvalidJson
+        ));
+    }
+
+    #[test]
+    fn ignores_valid_signal_free_event() {
+        assert!(matches!(
+            parse_stream_line(r#"{"type":"result","result":"ok"}"#),
+            StreamLineResult::Ignored
         ));
     }
 
@@ -490,6 +527,36 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(output, b"{\"type\":\"one\"}\n{\"type\":\"two\"}\n");
+    }
+
+    #[tokio::test]
+    async fn fragmented_overloaded_input_preserves_every_raw_byte() {
+        let state = AppState::new();
+        let (line_tx, mut line_rx) = mpsc::channel(1);
+        line_tx.try_send("already full".to_string()).unwrap();
+        let chunks: &[&[u8]] = &[
+            b"{\"type\":\"ass",
+            b"istant\"}\nnot json\n{\"unknown\":",
+            b"true}\n{\"partial\":true}",
+        ];
+        let expected = chunks.concat();
+        let mut output = Vec::new();
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            pump_raw_output(
+                FragmentedReader::new(chunks),
+                &mut output,
+                line_tx,
+                state.last_output_activity.clone(),
+            ),
+        )
+        .await
+        .expect("pump deadlocked")
+        .expect("pump failed");
+
+        assert_eq!(output, expected);
+        assert_eq!(line_rx.try_recv().as_deref(), Ok("already full"));
     }
 
     #[tokio::test]
