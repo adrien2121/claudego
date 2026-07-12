@@ -294,7 +294,7 @@ mod tests {
     async fn non_reading_client_does_not_block_sentinel_work() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let _non_reading_client = TcpStream::connect(address).await.unwrap();
+        let mut non_reading_client = TcpStream::connect(address).await.unwrap();
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -303,7 +303,7 @@ mod tests {
             "claudego-slow-client-{}-{unique}.log",
             std::process::id()
         ));
-        let (log_tx, log_rx) = mpsc::channel(100);
+        let (log_tx, log_rx) = mpsc::channel(1);
         let logger = tokio::spawn(run_logger(
             listener,
             path.clone(),
@@ -312,10 +312,25 @@ mod tests {
             Duration::from_millis(100),
         ));
 
-        let line = "x".repeat(16 * 1024);
-        for _ in 0..5_000 {
-            let _ = log_tx.try_send(LogMessage::Line(line.clone()));
-        }
+        let marker = "client-registered";
+        log_tx
+            .send(LogMessage::Line(marker.to_string()))
+            .await
+            .unwrap();
+        let mut received_marker = vec![0; marker.len() + 1];
+        timeout(
+            Duration::from_secs(5),
+            non_reading_client.read_exact(&mut received_marker),
+        )
+        .await
+        .expect("client registration marker timed out")
+        .unwrap();
+        assert_eq!(received_marker, format!("{marker}\n").as_bytes());
+
+        log_tx
+            .send(LogMessage::Line("x".repeat(16 * 1024 * 1024)))
+            .await
+            .unwrap();
 
         let (mut sentinel_writer, mut sentinel_reader) = tokio::io::duplex(64);
         let sentinel = timeout(Duration::from_secs(5), async {
