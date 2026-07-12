@@ -12,6 +12,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+const MAX_PARSER_LINE_BYTES: usize = 1024 * 1024;
+
 #[derive(Debug)]
 pub struct StreamJsonSignal {
     pub session_id: Option<String>,
@@ -43,6 +45,7 @@ where
 {
     let mut buf = [0_u8; 8192];
     let mut pending = Vec::new();
+    let mut discard_until_newline = false;
 
     loop {
         let n = reader.read(&mut buf).await?;
@@ -54,12 +57,49 @@ where
         writer.flush().await?;
         mark_output_activity(&activity);
 
-        pending.extend_from_slice(&buf[..n]);
-        while let Some(newline) = pending.iter().position(|byte| *byte == b'\n') {
-            let line_bytes: Vec<u8> = pending.drain(..=newline).collect();
-            if let Ok(line) = String::from_utf8(line_bytes) {
-                let line = line.trim_end_matches(['\r', '\n']).to_string();
-                let _ = line_tx.try_send(line);
+        let mut cursor = 0;
+        while cursor < n {
+            if discard_until_newline {
+                if let Some(newline) = buf[cursor..n].iter().position(|byte| *byte == b'\n') {
+                    cursor += newline + 1;
+                    discard_until_newline = false;
+                } else {
+                    break;
+                }
+                continue;
+            }
+
+            let bytes = &buf[cursor..n];
+            if let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') {
+                let line_bytes = &bytes[..newline];
+                let remaining_capacity = MAX_PARSER_LINE_BYTES - pending.len();
+                if line_bytes.len() > remaining_capacity {
+                    pending.clear();
+                    log_to_file(
+                        "[Stream JSON] NDJSON line exceeded parser limit; raw output was preserved.",
+                    );
+                } else {
+                    pending.extend_from_slice(line_bytes);
+                    if let Ok(line) = String::from_utf8(std::mem::take(&mut pending)) {
+                        let line = line.trim_end_matches('\r').to_string();
+                        let _ = line_tx.try_send(line);
+                    }
+                }
+                cursor += newline + 1;
+            } else {
+                let remaining_capacity = MAX_PARSER_LINE_BYTES - pending.len();
+                if bytes.len() <= remaining_capacity {
+                    pending.extend_from_slice(bytes);
+                    break;
+                }
+
+                pending.extend_from_slice(&bytes[..remaining_capacity]);
+                pending.clear();
+                log_to_file(
+                    "[Stream JSON] NDJSON line exceeded parser limit; raw output was preserved.",
+                );
+                discard_until_newline = true;
+                cursor += remaining_capacity;
             }
         }
     }
@@ -343,7 +383,7 @@ fn find_string_value(value: &Value, matches: &dyn Fn(&str) -> bool) -> Option<St
 mod tests {
     use super::{
         await_resume_after_exit, lockout_recorded_since, parse_stream_line, pump_raw_output,
-        resume_command_with_program, StreamLineResult, StreamProcessAction,
+        resume_command_with_program, StreamLineResult, StreamProcessAction, MAX_PARSER_LINE_BYTES,
     };
     use crate::cli::CommandSpec;
     use crate::models::{output_is_hot, AppState};
@@ -365,6 +405,12 @@ mod tests {
         fn new(chunks: &[&[u8]]) -> Self {
             Self {
                 chunks: chunks.iter().map(|chunk| chunk.to_vec()).collect(),
+            }
+        }
+
+        fn new_owned(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
             }
         }
     }
@@ -533,6 +579,31 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(output, b"{\"type\":\"one\"}\n{\"type\":\"two\"}\n");
+    }
+
+    #[tokio::test]
+    async fn oversized_line_preserves_raw_bytes_and_resumes_after_newline() {
+        let oversized = vec![b'x'; MAX_PARSER_LINE_BYTES + 1];
+        let valid = b"\n{\"type\":\"system\",\"session_id\":\"after-cap\"}\n";
+        let input = [oversized.as_slice(), valid].concat();
+        let (line_tx, mut line_rx) = mpsc::channel(4);
+        let mut output = Vec::new();
+
+        pump_raw_output(
+            FragmentedReader::new_owned(input.chunks(8192).map(Vec::from).collect()),
+            &mut output,
+            line_tx,
+            AppState::new().last_output_activity,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, input);
+        assert_eq!(
+            line_rx.recv().await.as_deref(),
+            Some(r#"{"type":"system","session_id":"after-cap"}"#)
+        );
+        assert!(line_rx.try_recv().is_err());
     }
 
     #[tokio::test]
