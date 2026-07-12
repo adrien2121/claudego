@@ -40,7 +40,10 @@ pub fn spawn_command_in_pty(command: CommandSpec) -> Result<PtySession> {
     })
 }
 
-pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppState) {
+pub fn spawn_output_reader(
+    mut reader: Box<dyn Read + Send>,
+    state: SharedAppState,
+) -> tokio::task::JoinHandle<()> {
     let reads = Arc::new(AtomicU64::new(0));
     let bytes = Arc::new(AtomicU64::new(0));
     let last_read_seconds = Arc::new(AtomicU64::new(0));
@@ -113,7 +116,7 @@ pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppSta
             reads.load(Ordering::Relaxed),
             bytes.load(Ordering::Relaxed)
         ));
-    });
+    })
 }
 
 fn output_telemetry_summary(reads: u64, bytes: u64, silence_seconds: u64) -> String {

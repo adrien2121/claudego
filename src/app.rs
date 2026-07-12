@@ -10,7 +10,24 @@ use crate::terminal::RawModeGuard;
 use anyhow::Result;
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
+
+const PTY_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
+enum ReaderDrain {
+    Completed,
+    JoinFailed(tokio::task::JoinError),
+    TimedOut,
+}
+
+async fn drain_reader(handle: tokio::task::JoinHandle<()>, timeout: Duration) -> ReaderDrain {
+    match tokio::time::timeout(timeout, handle).await {
+        Ok(Ok(())) => ReaderDrain::Completed,
+        Ok(Err(error)) => ReaderDrain::JoinFailed(error),
+        Err(_) => ReaderDrain::TimedOut,
+    }
+}
 
 pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
     // Unconditionally start logging
@@ -43,13 +60,22 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
             let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
             let _guard = RawModeGuard::init()?;
 
-            pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
+            let reader_handle = pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
             pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
             pty_bridge::spawn_resize_poller(session.master, session.initial_size);
             monitor::spawn_lockout_monitor(state, ResumeTarget::Pty(Arc::clone(&session.writer)));
 
             let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
             let _ = child_wait_handle.await??;
+            match drain_reader(reader_handle, PTY_DRAIN_TIMEOUT).await {
+                ReaderDrain::Completed => {}
+                ReaderDrain::JoinFailed(error) => {
+                    logging::log_to_file(&format!("[PTY Output Error] reader task failed: {error}"))
+                }
+                ReaderDrain::TimedOut => logging::log_to_file(&format!(
+                    "[PTY Output Error] reader drain timed out after {PTY_DRAIN_TIMEOUT:?}"
+                )),
+            }
         }
         RunnerKind::StreamJsonPrint => {
             let (resume_tx, resume_rx) = mpsc::unbounded_channel::<StreamResumeCommand>();
@@ -97,5 +123,20 @@ fn open_logs_terminal() {
             .arg("--")
             .arg(&logs_bin)
             .spawn();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drain_reader, ReaderDrain};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn reader_drain_timeout_is_bounded() {
+        let reader = tokio::spawn(std::future::pending::<()>());
+
+        let result = drain_reader(reader, Duration::from_millis(10)).await;
+
+        assert!(matches!(result, ReaderDrain::TimedOut));
     }
 }
