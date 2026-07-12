@@ -22,6 +22,12 @@ mod startup;
 
 use lifecycle::WatcherHandle;
 
+#[derive(Debug, PartialEq, Eq)]
+enum MonitorControl {
+    Continue,
+    Stop,
+}
+
 /// Spawns a dedicated thread to monitor Claude log files for rate limit lockouts.
 pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget) {
     tokio::spawn(async move {
@@ -52,14 +58,18 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                 if now >= target {
                     if retry_exhausted {
                         let event_res = handle.rx.recv().await;
-                        handle_event_result(
+                        if handle_event_result(
                             event_res,
                             &mut handle,
                             &state,
                             &mut next_log_time,
                             &mut scan_failure_logs,
                         )
-                        .await;
+                        .await
+                            == MonitorControl::Stop
+                        {
+                            return;
+                        }
                         continue;
                     }
                     runtime::handle_expiry(&state, &resume_target, target).await;
@@ -90,20 +100,28 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                         // Timer expired, loop will check if lockout is over or log progress.
                     }
                     event_res = handle.rx.recv() => {
-                        handle_event_result(event_res, &mut handle, &state, &mut next_log_time, &mut scan_failure_logs).await;
+                        if handle_event_result(event_res, &mut handle, &state, &mut next_log_time, &mut scan_failure_logs).await
+                            == MonitorControl::Stop
+                        {
+                            return;
+                        }
                     }
                 }
             } else {
                 // --- No lockout, wait for a file event ---
                 let event_res = handle.rx.recv().await;
-                handle_event_result(
+                if handle_event_result(
                     event_res,
                     &mut handle,
                     &state,
                     &mut next_log_time,
                     &mut scan_failure_logs,
                 )
-                .await;
+                .await
+                    == MonitorControl::Stop
+                {
+                    return;
+                }
             }
         }
     });
@@ -115,7 +133,7 @@ async fn handle_event_result(
     state: &SharedAppState,
     next_log_time: &mut Instant,
     scan_failure_logs: &mut HashMap<std::path::PathBuf, Instant>,
-) {
+) -> MonitorControl {
     match event_res {
         Some(Ok(first_event)) => {
             let paths = events::debounce_events(first_event, &mut handle.rx).await;
@@ -128,16 +146,26 @@ async fn handle_event_result(
         None => {
             // The watcher channel disconnected. Attempt to recover.
             log_to_file("[Watcher] Disconnected. Attempting recovery…");
-            if let Some(new_handle) = lifecycle::create_watcher().await {
+            return recovery_control(async {
+                let new_handle = lifecycle::create_watcher().await?;
                 *handle = new_handle;
-            } else {
-                // If recovery fails, we can't do much more. The task will exit.
-                // In a real-world robust scenario, this might try to panic and restart the process.
-                log_to_file(
-                    "[Watcher Error] CRITICAL: Watcher recovery failed. Monitoring has stopped.",
-                );
-            }
+                Some(())
+            })
+            .await;
         }
+    }
+
+    MonitorControl::Continue
+}
+
+async fn recovery_control<T>(
+    recovery: impl std::future::Future<Output = Option<T>>,
+) -> MonitorControl {
+    if recovery.await.is_some() {
+        MonitorControl::Continue
+    } else {
+        log_to_file("[Watcher Error] CRITICAL: Watcher recovery failed. Monitoring has stopped.");
+        MonitorControl::Stop
     }
 }
 
@@ -147,4 +175,21 @@ pub fn record_lockout(
     source: &str,
 ) {
     runtime::record_lockout(state, limit_info, source);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn exhausted_recovery_stops_monitor() {
+        let control = recovery_control(async { None::<WatcherHandle> }).await;
+        assert_eq!(control, MonitorControl::Stop);
+    }
+
+    #[tokio::test]
+    async fn successful_recovery_continues_monitor() {
+        let control = recovery_control(async { Some(()) }).await;
+        assert_eq!(control, MonitorControl::Continue);
+    }
 }
