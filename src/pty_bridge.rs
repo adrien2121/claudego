@@ -1,9 +1,12 @@
 use crate::cli::CommandSpec;
+use crate::logging::log_to_file;
 use crate::models::{mark_output_activity, SharedAppState};
 use anyhow::Result;
 use portable_pty::{Child, CommandBuilder, MasterPty, NativePtySystem, PtySize, PtySystem};
 use std::io::{self, Read, Write};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 pub type SharedPtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -38,22 +41,83 @@ pub fn spawn_command_in_pty(command: CommandSpec) -> Result<PtySession> {
 }
 
 pub fn spawn_output_reader(mut reader: Box<dyn Read + Send>, state: SharedAppState) {
+    let reads = Arc::new(AtomicU64::new(0));
+    let bytes = Arc::new(AtomicU64::new(0));
+    let last_read_seconds = Arc::new(AtomicU64::new(0));
+    let done = Arc::new(AtomicBool::new(false));
+    let started = Instant::now();
+
+    let heartbeat_reads = Arc::clone(&reads);
+    let heartbeat_bytes = Arc::clone(&bytes);
+    let heartbeat_last_read = Arc::clone(&last_read_seconds);
+    let heartbeat_done = Arc::clone(&done);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.tick().await;
+        while !heartbeat_done.load(Ordering::Relaxed) {
+            interval.tick().await;
+            let silence = started
+                .elapsed()
+                .as_secs()
+                .saturating_sub(heartbeat_last_read.load(Ordering::Relaxed));
+            log_to_file(&output_telemetry_summary(
+                heartbeat_reads.load(Ordering::Relaxed),
+                heartbeat_bytes.load(Ordering::Relaxed),
+                silence,
+            ));
+        }
+    });
+
     tokio::task::spawn_blocking(move || {
+        log_to_file("[PTY Output] reader started");
         // Clone the atomic tracker once to avoid locking the state in the loop.
         let activity_tracker = state.lock().unwrap().last_output_activity.clone();
         let mut buf = [0u8; 64 * 1024];
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        while let Ok(n) = reader.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
+        let mut write_error_logged = false;
+        let mut flush_error_logged = false;
+        loop {
+            let n = match reader.read(&mut buf) {
+                Ok(0) => {
+                    log_to_file("[PTY Output] reader reached EOF");
+                    break;
+                }
+                Ok(n) => n,
+                Err(error) => {
+                    log_to_file(&format!("[PTY Output Error] read failed: {error}"));
+                    break;
+                }
+            };
+            reads.fetch_add(1, Ordering::Relaxed);
+            bytes.fetch_add(n as u64, Ordering::Relaxed);
+            last_read_seconds.store(started.elapsed().as_secs(), Ordering::Relaxed);
             mark_output_activity(&activity_tracker);
 
-            let _ = stdout.write_all(&buf[..n]);
-            let _ = stdout.flush();
+            if let Err(error) = stdout.write_all(&buf[..n]) {
+                if !write_error_logged {
+                    log_to_file(&format!("[PTY Output Error] stdout write failed: {error}"));
+                    write_error_logged = true;
+                }
+            }
+            if let Err(error) = stdout.flush() {
+                if !flush_error_logged {
+                    log_to_file(&format!("[PTY Output Error] stdout flush failed: {error}"));
+                    flush_error_logged = true;
+                }
+            }
         }
+        done.store(true, Ordering::Relaxed);
+        log_to_file(&format!(
+            "[PTY Output] reader stopped; reads={} bytes={}",
+            reads.load(Ordering::Relaxed),
+            bytes.load(Ordering::Relaxed)
+        ));
     });
+}
+
+fn output_telemetry_summary(reads: u64, bytes: u64, silence_seconds: u64) -> String {
+    format!("[PTY Output] alive; reads={reads} bytes={bytes} silence={silence_seconds}s")
 }
 
 pub fn spawn_input_writer(writer: SharedPtyWriter) {
@@ -129,5 +193,22 @@ fn to_pty_size((cols, rows): TerminalSize) -> PtySize {
         cols,
         pixel_width: 0,
         pixel_height: 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::output_telemetry_summary;
+
+    #[test]
+    fn output_telemetry_summary_distinguishes_silence_from_forwarded_bytes() {
+        assert_eq!(
+            output_telemetry_summary(0, 0, 90),
+            "[PTY Output] alive; reads=0 bytes=0 silence=90s"
+        );
+        assert_eq!(
+            output_telemetry_summary(3, 42, 5),
+            "[PTY Output] alive; reads=3 bytes=42 silence=5s"
+        );
     }
 }
