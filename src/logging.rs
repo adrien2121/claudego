@@ -44,6 +44,133 @@ where
         .is_ok_and(|result| result.is_ok())
 }
 
+async fn run_logger(
+    listener: TcpListener,
+    path: std::path::PathBuf,
+    mut log_rx: mpsc::Receiver<LogMessage>,
+    max_startup_lines: usize,
+    client_write_timeout: Duration,
+) {
+    let mut clients: Vec<TcpStream> = Vec::new();
+    let mut initial_buffer: VecDeque<String> = VecDeque::new();
+    let mut has_first_client_connected = false;
+
+    let mut writer = match tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .await
+    {
+        Ok(file) => BufWriter::new(file),
+        Err(_) => return,
+    };
+    let mut current_size = tokio::fs::metadata(&path)
+        .await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    loop {
+        tokio::select! {
+            Ok((mut stream, _)) = listener.accept() => {
+                let mut client_ok = true;
+                if !has_first_client_connected {
+                    for line in &initial_buffer {
+                        if !write_with_timeout(
+                            &mut stream,
+                            line.as_bytes(),
+                            client_write_timeout,
+                        )
+                        .await
+                        {
+                            client_ok = false;
+                            break;
+                        }
+                    }
+                    if client_ok {
+                        initial_buffer.clear();
+                        initial_buffer.shrink_to_fit();
+                        has_first_client_connected = true;
+                    }
+                }
+                if client_ok {
+                    clients.push(stream);
+                }
+            }
+            Some(msg) = log_rx.recv() => {
+                match msg {
+                    LogMessage::Line(mut line) => {
+                        line.push('\n');
+                        if !has_first_client_connected {
+                            push_startup_line(
+                                &mut initial_buffer,
+                                line.clone(),
+                                max_startup_lines,
+                            );
+                        } else {
+                            let mut dead_clients = Vec::new();
+                            for (i, client) in clients.iter_mut().enumerate() {
+                                if !write_with_timeout(
+                                    client,
+                                    line.as_bytes(),
+                                    client_write_timeout,
+                                )
+                                .await
+                                {
+                                    dead_clients.push(i);
+                                }
+                            }
+                            for i in dead_clients.into_iter().rev() {
+                                clients.remove(i);
+                            }
+                        }
+
+                        if current_size > MAX_LOG_SIZE {
+                            if writer.flush().await.is_err() { return; }
+                            drop(writer);
+
+                            let backup_path = path.with_extension("log.old");
+                            if tokio::fs::rename(&path, &backup_path).await.is_err() { return; }
+
+                            let new_file = match tokio::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(&path)
+                            .await {
+                                Ok(f) => f,
+                                Err(_) => return,
+                            };
+                            writer = BufWriter::new(new_file);
+                            current_size = 0;
+
+                            let rotation_msg = format!("[{}] Log file exceeded {}MB and was rotated. Previous log saved to: {}\n",
+                                Local::now().format("%H:%M:%S"),
+                                MAX_LOG_SIZE / (1024 * 1024),
+                                backup_path.display()
+                            );
+                            if writer.write_all(rotation_msg.as_bytes()).await.is_ok() {
+                                current_size += rotation_msg.len() as u64;
+                            }
+                        }
+
+                        let bytes_to_write = line.len() as u64;
+                        if writer.write_all(line.as_bytes()).await.is_err() {
+                            return;
+                        }
+                        current_size += bytes_to_write;
+                    }
+                    LogMessage::Shutdown => {
+                        break;
+                    }
+                }
+            }
+            else => {
+                break;
+            }
+        }
+    }
+    let _ = writer.flush().await;
+}
+
 /// Initializes the asynchronous logger, spawning a dedicated thread for file I/O.
 ///
 /// This function should be called once at application startup. It returns the handle
@@ -76,146 +203,14 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
                 let _ = ready_tx.send(()); // Use blocking send for initial setup
             }
         }
-        let mut clients: Vec<TcpStream> = Vec::new();
-
-        // Buffer for logs generated before the first client connects. This ensures
-        // the log viewer gets the full startup history.
-        let mut initial_buffer: VecDeque<String> = VecDeque::new();
-        let mut has_first_client_connected = false;
-
-        // --- 2. Set up file writer for persistent logs ---
-        let mut writer = match tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .await
-        {
-            Ok(file) => BufWriter::new(file),
-            Err(_) => return, // Cannot open log file, stop logging.
-        };
-
-        // Get initial size.
-        let mut current_size = tokio::fs::metadata(&path)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-
-        // --- 3. Main logging loop (selects between clients and messages) ---
-        let mut log_rx = log_rx; // Move receiver into the loop
-        loop {
-            tokio::select! {
-                // A. Accept any new incoming connections for live logging.
-                Ok((mut stream, _)) = listener.accept() => {
-                    let mut client_ok = true;
-                    if !has_first_client_connected {
-                        // This is the first client. Dump the startup log buffer to it.
-                        for line in &initial_buffer {
-                            if !write_with_timeout(
-                                &mut stream,
-                                line.as_bytes(),
-                                CLIENT_WRITE_TIMEOUT,
-                            )
-                            .await
-                            {
-                                // If we can't even write the buffer, this client is no good.
-                                client_ok = false;
-                                break;
-                            }
-                        }
-                        if client_ok {
-                            // Successfully dumped buffer. Transition to live streaming mode.
-                            initial_buffer.clear();
-                            initial_buffer.shrink_to_fit();
-                            has_first_client_connected = true;
-                        }
-                    }
-                    if client_ok {
-                        clients.push(stream);
-                    }
-                }
-
-                // B. Check for a message from the application.
-                Some(msg) = log_rx.recv() => {
-                    match msg {
-                        LogMessage::Line(mut line) => {
-                            line.push('\n'); // Ensure line has a newline for streams
-
-                            // B.1. Send to live-log network clients or buffer if none have connected.
-                            if !has_first_client_connected {
-                                push_startup_line(
-                                    &mut initial_buffer,
-                                    line.clone(),
-                                    MAX_STARTUP_BUFFER_LINES,
-                                );
-                            } else {
-                                let mut dead_clients = Vec::new();
-                                for (i, client) in clients.iter_mut().enumerate() {
-                                    if !write_with_timeout(
-                                        client,
-                                        line.as_bytes(),
-                                        CLIENT_WRITE_TIMEOUT,
-                                    )
-                                    .await
-                                    {
-                                        dead_clients.push(i);
-                                    }
-                                }
-                                // Remove dead clients in reverse to preserve indices
-                                for i in dead_clients.into_iter().rev() {
-                                    clients.remove(i);
-                                }
-                            }
-
-                            // B.2. Write to persistent log file (buffered)
-                            // --- Log Rotation Logic ---
-                            if current_size > MAX_LOG_SIZE {
-                                if writer.flush().await.is_err() { return; }
-                                drop(writer); // Close file
-
-                                let backup_path = path.with_extension("log.old");
-                                if tokio::fs::rename(&path, &backup_path).await.is_err() { return; }
-
-                                let new_file = match tokio::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&path)
-                                .await {
-                                    Ok(f) => f,
-                                    Err(_) => return,
-                                };
-                                writer = BufWriter::new(new_file);
-                                current_size = 0;
-
-                                let rotation_msg = format!("[{}] Log file exceeded {}MB and was rotated. Previous log saved to: {}\n",
-                                    Local::now().format("%H:%M:%S"),
-                                    MAX_LOG_SIZE / (1024 * 1024),
-                                    backup_path.display()
-                                );
-                                if writer.write_all(rotation_msg.as_bytes()).await.is_ok() {
-                                    current_size += rotation_msg.len() as u64;
-                                }
-                            }
-
-                            // --- Write the actual log message ---
-                            let bytes_to_write = line.len() as u64;
-                            if writer.write_all(line.as_bytes()).await.is_err() {
-                                return;
-                            }
-                            current_size += bytes_to_write;
-                        }
-                        LogMessage::Shutdown => {
-                            break; // Exit the select loop
-                        }
-                    }
-                }
-                else => {
-                    // Channel closed, main app has shut down.
-                    break;
-                }
-            }
-        }
-        // Ensure any remaining buffered content is written to disk before exiting.
-        let _ = writer.flush().await;
+        run_logger(
+            listener,
+            path,
+            log_rx,
+            MAX_STARTUP_BUFFER_LINES,
+            CLIENT_WRITE_TIMEOUT,
+        )
+        .await;
         // Clean up the port file on graceful shutdown.
         let _ = fs::remove_file(paths::port_path());
     });
@@ -261,9 +256,13 @@ pub fn log_with_content(prefix: &str, content: String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{push_startup_line, write_with_timeout};
+    use super::{push_startup_line, run_logger, write_with_timeout, LogMessage};
     use std::collections::VecDeque;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::mpsc;
+    use tokio::time::timeout;
 
     #[test]
     fn startup_buffer_keeps_newest_lines_only() {
@@ -289,5 +288,51 @@ mod tests {
         let bytes = vec![b'x'; 1024 * 1024];
 
         assert!(!write_with_timeout(&mut writer, &bytes, Duration::from_millis(1)).await);
+    }
+
+    #[tokio::test]
+    async fn non_reading_client_does_not_block_sentinel_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _non_reading_client = TcpStream::connect(address).await.unwrap();
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "claudego-slow-client-{}-{unique}.log",
+            std::process::id()
+        ));
+        let (log_tx, log_rx) = mpsc::channel(100);
+        let logger = tokio::spawn(run_logger(
+            listener,
+            path.clone(),
+            log_rx,
+            500,
+            Duration::from_millis(100),
+        ));
+
+        let line = "x".repeat(16 * 1024);
+        for _ in 0..5_000 {
+            let _ = log_tx.try_send(LogMessage::Line(line.clone()));
+        }
+
+        let (mut sentinel_writer, mut sentinel_reader) = tokio::io::duplex(64);
+        let sentinel = timeout(Duration::from_secs(5), async {
+            sentinel_writer.write_all(b"sentinel").await.unwrap();
+            let mut bytes = [0; 8];
+            sentinel_reader.read_exact(&mut bytes).await.unwrap();
+            bytes
+        })
+        .await
+        .expect("sentinel work timed out");
+        assert_eq!(&sentinel, b"sentinel");
+
+        log_tx.send(LogMessage::Shutdown).await.unwrap();
+        timeout(Duration::from_secs(5), logger)
+            .await
+            .expect("logger did not shut down")
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 }

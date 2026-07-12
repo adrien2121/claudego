@@ -215,11 +215,67 @@ pub(super) fn handle_expiry(
 
 #[cfg(test)]
 mod tests {
-    use super::record_lockout;
+    use super::{record_lockout, scan_and_update_state};
     use crate::models::AppState;
     use crate::watcher::scan::ActiveRateLimitInfo;
     use chrono::{Duration, Local};
+    use std::collections::HashSet;
+    use std::fs::OpenOptions;
+    use std::io::Write;
     use std::sync::{Arc, Mutex};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn direct_scan_records_one_file_watcher_lockout_from_new_content() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "claudego-direct-scan-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("session.jsonl");
+        std::fs::write(&path, "{\"type\":\"baseline\"}\n").unwrap();
+        let baseline_len = std::fs::metadata(&path).unwrap().len();
+
+        let state = Arc::new(Mutex::new(AppState::new()));
+        state
+            .lock()
+            .unwrap()
+            .file_size_cache
+            .insert(path.clone(), baseline_len);
+
+        let now = Local::now();
+        let target = now + chrono::Duration::hours(2);
+        let reset = target.format("%-I:%M%P").to_string();
+        let row = format!(
+            "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"You've hit your session limit · resets {reset} (America/Toronto)\"}}]}}}}\n",
+            now.to_rfc3339()
+        );
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(row.as_bytes())
+            .unwrap();
+
+        let mut next_log_time = Instant::now();
+        scan_and_update_state(HashSet::from([path.clone()]), &state, &mut next_log_time).await;
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_revision, 1);
+        assert_eq!(
+            app.lockout_target_time
+                .expect("watcher target")
+                .format("%-I:%M%P")
+                .to_string(),
+            reset
+        );
+        drop(app);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn stream_lockout_updates_shared_state() {
