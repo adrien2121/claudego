@@ -1,6 +1,7 @@
 use chrono::Local;
 use std::collections::VecDeque;
 use std::fs;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Receiver as StdReceiver;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -16,17 +17,35 @@ enum LogMessage {
     /// A single line of text to be written to the log.
     Line(String),
     /// A signal to flush the buffer and terminate the logger thread.
-    Shutdown,
+    Shutdown { dropped: u64 },
 }
 
 /// Global sender for the logging channel.
 /// `OnceLock` is a modern and efficient way to handle global static initialization.
 static LOGGER_SENDER: OnceLock<Sender<LogMessage>> = OnceLock::new();
+static DROPPED_LOG_MESSAGES: AtomicU64 = AtomicU64::new(0);
 
 /// The maximum size of the log file in bytes before it is rotated. (10 MiB)
 const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024;
 const MAX_STARTUP_BUFFER_LINES: usize = 500;
 const CLIENT_WRITE_TIMEOUT: Duration = Duration::from_millis(100);
+
+fn try_queue_line(sender: &Sender<LogMessage>, dropped: &AtomicU64, mut line: String) {
+    match sender.try_reserve() {
+        Ok(permit) => {
+            let count = dropped.swap(0, Ordering::AcqRel);
+            if count > 0 {
+                line =
+                    format!("[Logger] {count} diagnostic message(s) dropped: channel full\n{line}");
+            }
+            permit.send(LogMessage::Line(line));
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            dropped.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
 
 fn push_startup_line(buffer: &mut VecDeque<String>, line: String, max_lines: usize) {
     if buffer.len() == max_lines {
@@ -158,7 +177,13 @@ async fn run_logger(
                         }
                         current_size += bytes_to_write;
                     }
-                    LogMessage::Shutdown => {
+                    LogMessage::Shutdown { dropped } => {
+                        if dropped > 0 {
+                            let summary = format!(
+                                "[Logger] {dropped} diagnostic message(s) dropped: channel full\n"
+                            );
+                            let _ = writer.write_all(summary.as_bytes()).await;
+                        }
                         break;
                     }
                 }
@@ -223,7 +248,10 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
 pub async fn shutdown_logging(handle: tokio::task::JoinHandle<()>) {
     if let Some(sender) = LOGGER_SENDER.get() {
         // The receiver might already be gone if the thread panicked, so ignore errors.
-        let _ = sender.send(LogMessage::Shutdown).await;
+        let dropped = DROPPED_LOG_MESSAGES.swap(0, Ordering::AcqRel);
+        if sender.send(LogMessage::Shutdown { dropped }).await.is_err() {
+            DROPPED_LOG_MESSAGES.fetch_add(dropped, Ordering::Relaxed);
+        }
     }
     // Wait for the logger thread to process all messages and exit.
     let _ = handle.await;
@@ -236,9 +264,7 @@ pub fn reset_log_file() {
 pub fn log_to_file(msg: &str) {
     if let Some(sender) = LOGGER_SENDER.get() {
         let line = format!("[{}] {}", Local::now().format("%H:%M:%S"), msg);
-        // If the receiver has been dropped, the logger thread is dead.
-        // We use a non-blocking `try_send` because this function is not async.
-        let _ = sender.try_send(LogMessage::Line(line));
+        try_queue_line(sender, &DROPPED_LOG_MESSAGES, line);
     }
 }
 
@@ -250,19 +276,40 @@ pub fn log_with_content(prefix: &str, content: String) {
         let full_log = format!("{}\n{}", prefix_line, content.trim_end());
 
         // Send the combined string as a single message to ensure it's written atomically.
-        let _ = sender.try_send(LogMessage::Line(full_log));
+        try_queue_line(sender, &DROPPED_LOG_MESSAGES, full_log);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{push_startup_line, run_logger, write_with_timeout, LogMessage};
+    use super::{push_startup_line, run_logger, try_queue_line, write_with_timeout, LogMessage};
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::sync::mpsc;
     use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn full_channel_reports_aggregate_on_next_success() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let dropped = AtomicU64::new(0);
+        tx.try_send(LogMessage::Line("occupied".into())).unwrap();
+
+        try_queue_line(&tx, &dropped, "lost one".into());
+        try_queue_line(&tx, &dropped, "lost two".into());
+        assert_eq!(dropped.load(Ordering::Relaxed), 2);
+        assert!(matches!(rx.recv().await, Some(LogMessage::Line(_))));
+
+        try_queue_line(&tx, &dropped, "next".into());
+        let Some(LogMessage::Line(line)) = rx.recv().await else {
+            panic!()
+        };
+        assert!(line.contains("2 diagnostic message(s) dropped"));
+        assert!(line.contains("next"));
+        assert_eq!(dropped.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn startup_buffer_keeps_newest_lines_only() {
@@ -343,7 +390,10 @@ mod tests {
         .expect("sentinel work timed out");
         assert_eq!(&sentinel, b"sentinel");
 
-        log_tx.send(LogMessage::Shutdown).await.unwrap();
+        log_tx
+            .send(LogMessage::Shutdown { dropped: 0 })
+            .await
+            .unwrap();
         timeout(Duration::from_secs(5), logger)
             .await
             .expect("logger did not shut down")
