@@ -16,12 +16,35 @@ fn write_fragmented(out: &mut impl Write, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+fn scenario_from<'a>(args: impl IntoIterator<Item = &'a str>) -> Option<&'a str> {
+    args.into_iter()
+        .last()
+        .filter(|scenario| matches!(*scenario, "stream-signal" | "no-stream-signal"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn accepts_scenario_after_claude_style_flags() {
+        let args = [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "no-stream-signal",
+        ];
+
+        assert_eq!(super::scenario_from(args), Some("no-stream-signal"));
+    }
+}
+
 fn main() -> std::io::Result<()> {
-    let scenario = std::env::args().nth(1).unwrap_or_default();
-    if !matches!(scenario.as_str(), "stream-signal" | "no-stream-signal") {
+    let args: Vec<String> = std::env::args().collect();
+    let scenario = scenario_from(args.iter().map(String::as_str));
+    let Some(scenario) = scenario else {
         eprintln!("usage: stream-stress-child <stream-signal|no-stream-signal>");
         std::process::exit(2);
-    }
+    };
 
     let mut out = std::io::stdout().lock();
     write_fragmented(&mut out, ORDINARY)?;
@@ -39,6 +62,8 @@ fn main() -> std::io::Result<()> {
     }
     write_fragmented(&mut out, b"{\"incomplete\":true}")?;
     eprintln!("READY");
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    // macOS FSEvents delivery can exceed the output-hot threshold by several seconds.
+    // Keep the child alive long enough for the real watcher to observe the test append.
+    std::thread::sleep(std::time::Duration::from_secs(10));
     Ok(())
 }
