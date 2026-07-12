@@ -22,22 +22,6 @@ fn scenario_from<'a>(args: impl IntoIterator<Item = &'a str>) -> Option<&'a str>
         .filter(|scenario| matches!(*scenario, "stream-signal" | "no-stream-signal"))
 }
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn accepts_scenario_after_claude_style_flags() {
-        let args = [
-            "claude",
-            "-p",
-            "--output-format",
-            "stream-json",
-            "no-stream-signal",
-        ];
-
-        assert_eq!(super::scenario_from(args), Some("no-stream-signal"));
-    }
-}
-
 fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let scenario = scenario_from(args.iter().map(String::as_str));
@@ -66,4 +50,20 @@ fn main() -> std::io::Result<()> {
     // Keep the child alive long enough for the real watcher to observe the test append.
     std::thread::sleep(std::time::Duration::from_secs(10));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn accepts_scenario_after_claude_style_flags() {
+        let args = [
+            "claude",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "no-stream-signal",
+        ];
+
+        assert_eq!(super::scenario_from(args), Some("no-stream-signal"));
+    }
 }

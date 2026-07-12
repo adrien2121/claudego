@@ -55,11 +55,19 @@ Upgrade/replace decision: NOT JUSTIFIED; reconsider portable-pty only after the 
 
 ## P1 — Add end-to-end streaming stress coverage
 
-- [ ] Run a synthetic NDJSON child through the full stream runner; verify raw output and signal detection.
-- [ ] Verify the file-watcher fixture still detects a limit when stream events lack the signal.
-- [ ] Stress the logger with many diagnostics and a slow TCP client; verify the main output path never blocks.
+- [x] Run a synthetic NDJSON child through the full stream runner; verify raw output and signal detection.
+- [x] Verify the file-watcher fixture still detects a limit when stream events lack the signal.
+- [x] Stress the logger with many diagnostics and a slow TCP client; verify the main output path never blocks.
 
 Done when these paths are covered by deterministic tests without requiring a live Claude account.
+
+### Acceptance gates — 2026-07-12
+
+```text
+cargo fmt --check
+cargo test
+cargo clippy --all-targets --all-features -- -D warnings
+```
 
 ## P1 — Validate authenticated resume behavior
 
