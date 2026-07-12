@@ -1,16 +1,89 @@
 //! Raw, dependency-free measurements for runtime-hardening candidates.
 
 use serde_json::json;
+use std::collections::HashMap;
 use std::error::Error;
-use std::fs::{self, File};
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::PathBuf;
 use std::process;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
+
+mod logging {
+    pub fn log_to_file(_: &str) {}
+}
+mod models {
+    use super::*;
+    pub struct AppState {
+        pub file_size_cache: HashMap<PathBuf, u64>,
+        pub lockout_target_time: Option<chrono::DateTime<chrono::Local>>,
+    }
+    pub type SharedAppState = Arc<std::sync::Mutex<AppState>>;
+}
+mod monitor {
+    pub mod helpers {
+        pub const SCAN_CHUNK_SIZE: usize = 65_536;
+    }
+}
+mod watcher {
+    pub mod files {
+        use std::path::{Path, PathBuf};
+        use std::time::SystemTime;
+        pub fn claude_projects_root() -> Option<PathBuf> {
+            dirs::home_dir().map(|home| home.join(".claude/projects"))
+        }
+        pub fn recent_session_logs(root: &Path, after: SystemTime) -> Vec<(PathBuf, SystemTime)> {
+            let mut files = Vec::new();
+            if let Ok(projects) = std::fs::read_dir(root) {
+                for project in projects.flatten().filter(|p| p.path().is_dir()) {
+                    if let Ok(entries) = std::fs::read_dir(project.path()) {
+                        for entry in entries.flatten() {
+                            if let Ok(meta) = entry.metadata() {
+                                if meta.is_file()
+                                    && entry.path().extension().and_then(|x| x.to_str())
+                                        == Some("jsonl")
+                                {
+                                    if let Ok(modified) = meta.modified() {
+                                        if modified > after {
+                                            files.push((entry.path(), modified));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            files
+        }
+    }
+    pub mod scan {
+        use chrono::{DateTime, Local};
+        #[allow(dead_code)]
+        #[derive(Debug)]
+        pub struct ActiveRateLimitInfo {
+            pub target_time: DateTime<Local>,
+            pub display_str: String,
+            pub raw_message: String,
+        }
+        #[allow(dead_code)]
+        #[derive(Debug)]
+        pub enum InitialScanResult {
+            Active(ActiveRateLimitInfo),
+            Stale,
+            NoLimitFound,
+        }
+        pub fn scan_content_for_any_limit(_: &str) -> InitialScanResult {
+            InitialScanResult::NoLimitFound
+        }
+    }
+}
+#[allow(clippy::single_component_path_imports)]
+#[path = "../src/monitor/startup.rs"]
+mod production_startup;
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const STARTUP_FILES: usize = 256;
@@ -104,9 +177,17 @@ async fn startup_scan(run: usize) -> Result<()> {
     });
     ready_rx.await?;
     let started = Instant::now();
-    let discovered = PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
-        .join(".claude/projects/bench");
-    let bytes = synchronous_initial_scan(&discovered)?;
+    let state = Arc::new(std::sync::Mutex::new(models::AppState {
+        file_size_cache: HashMap::new(),
+        lockout_target_time: None,
+    }));
+    production_startup::initial_scan(&state);
+    let bytes: u64 = state
+        .lock()
+        .map_err(|_| "state poisoned")?
+        .file_size_cache
+        .values()
+        .sum();
     let elapsed = started.elapsed();
     ticker.await?;
     println!(
@@ -114,24 +195,6 @@ async fn startup_scan(run: usize) -> Result<()> {
         json!({"case":"startup-scan","run":run,"fixture_files":STARTUP_FILES,"fixture_bytes":bytes,"scan_ms":ms(elapsed),"max_scheduling_delay_ms":ms(*max_delay.lock().await),"output_equal":true})
     );
     Ok(())
-}
-
-fn synchronous_initial_scan(root: &Path) -> Result<u64> {
-    let mut total = 0;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    for entry in fs::read_dir(root)? {
-        let mut file = File::open(entry?.path())?;
-        let size = file.metadata()?.len();
-        total += size;
-        let mut position = size;
-        while position > 0 {
-            let start = position.saturating_sub(buffer.len() as u64);
-            file.seek(SeekFrom::Start(start))?;
-            file.read_exact(&mut buffer[..(position - start) as usize])?;
-            position = start;
-        }
-    }
-    Ok(total)
 }
 
 async fn logger_fanout(run: usize) -> Result<()> {
@@ -162,20 +225,25 @@ async fn logger_fanout(run: usize) -> Result<()> {
         }
         Ok::<_, std::io::Error>((bytes, started.elapsed()))
     });
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
-    let mut dropped = 0_u64;
-    for _ in 0..LOG_MESSAGES {
-        let mut line = vec![b'l'; LOG_MESSAGE_BYTES + 1];
-        line[LOG_MESSAGE_BYTES] = b'\n';
-        if tx.try_send(line).is_err() {
-            dropped += 1;
-        }
-    }
-    drop(tx);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(Instant, Vec<u8>)>(100);
     let started = Instant::now();
+    let producer = tokio::spawn(async move {
+        let mut dropped = 0_u64;
+        for marker in 0..LOG_MESSAGES {
+            let mut line = format!("marker={marker:04} ").into_bytes();
+            line.resize(LOG_MESSAGE_BYTES, b'l');
+            line.push(b'\n');
+            if tx.try_send((Instant::now(), line)).is_err() {
+                dropped += 1;
+            }
+            tokio::task::yield_now().await;
+        }
+        dropped
+    });
     let mut file = tokio::fs::File::create(&log_path).await?;
     let mut delivered = 0_usize;
-    while let Some(line) = rx.recv().await {
+    let mut max_file_marker_latency = Duration::ZERO;
+    while let Some((enqueued, line)) = rx.recv().await {
         let mut dead = Vec::new();
         for (index, client) in clients.iter_mut().enumerate() {
             if !matches!(
@@ -189,17 +257,20 @@ async fn logger_fanout(run: usize) -> Result<()> {
             clients.remove(index);
         }
         file.write_all(&line).await?;
+        file.flush().await?;
+        max_file_marker_latency = max_file_marker_latency.max(enqueued.elapsed());
         delivered += line.len();
     }
     file.flush().await?;
     let file_latency = started.elapsed();
+    let dropped = producer.await?;
     drop(clients);
     let (healthy_bytes, viewer_latency) = healthy_task.await??;
     let output_equal =
         fs::metadata(&log_path)?.len() as usize == delivered && healthy_bytes == delivered;
     println!(
         "{}",
-        json!({"case":"logger-fanout","run":run,"fixture_messages":LOG_MESSAGES,"fixture_message_bytes":LOG_MESSAGE_BYTES,"slow_clients":SLOW_CLIENTS,"file_log_latency_ms":ms(file_latency),"healthy_viewer_latency_ms":ms(viewer_latency),"dropped_messages":dropped,"output_equal":output_equal})
+        json!({"case":"logger-fanout","run":run,"fixture_messages":LOG_MESSAGES,"fixture_message_bytes":LOG_MESSAGE_BYTES,"slow_clients":SLOW_CLIENTS,"file_log_latency_ms":ms(max_file_marker_latency),"healthy_viewer_latency_ms":ms(viewer_latency),"total_elapsed_ms":ms(file_latency),"dropped_messages":dropped,"output_equal":output_equal})
     );
     drop(slow);
     Ok(())
