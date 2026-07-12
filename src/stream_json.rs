@@ -148,35 +148,41 @@ async fn run_one_stream_process(
         latest_session_id,
     ));
 
-    let live_restart_requested = tokio::select! {
+    let (live_restart_requested, child_status) = tokio::select! {
         status = child.wait() => {
             let status = status?;
             log_to_file(&format!(
                 "[Stream JSON] Claude exited with status {status}."
             ));
-            false
+            (false, Some(status))
         }
         command = resume_rx.recv() => {
             match command {
                 Some(StreamResumeCommand::Continue) => {
                     log_to_file("[Stream JSON] Continue requested. Killing print-mode child for restart with --resume.");
                     restart_running_child(&mut child).await?;
-                    true
+                    (true, None)
                 }
                 None => {
                     let status = child.wait().await?;
                     log_to_file(&format!(
                         "[Stream JSON] Claude exited with status {status}."
                     ));
-                    false
+                    (false, Some(status))
                 }
             }
         }
     };
 
-    let _ = stdout_task.await;
-    let _ = stderr_task.await;
-    let _ = parser_task.await;
+    stdout_task.await??;
+    stderr_task.await??;
+    parser_task.await?;
+
+    if let Some(status) = child_status {
+        if !status.success() {
+            anyhow::bail!("stream child exited with status {status}");
+        }
+    }
 
     if live_restart_requested {
         return Ok(StreamProcessAction::Restart);
