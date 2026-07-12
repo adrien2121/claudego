@@ -214,18 +214,20 @@ async fn logger_fanout(run: usize) -> Result<()> {
     }
     let healthy_task = tokio::spawn(async move {
         let started = Instant::now();
-        let mut bytes = 0;
+        let mut output = Vec::new();
         let mut buffer = vec![0; 64 * 1024];
         loop {
             let n = healthy_read.read(&mut buffer).await?;
             if n == 0 {
                 break;
             }
-            bytes += n;
+            output.extend_from_slice(&buffer[..n]);
         }
-        Ok::<_, std::io::Error>((bytes, started.elapsed()))
+        Ok::<_, std::io::Error>((output, started.elapsed()))
     });
     let (tx, mut rx) = tokio::sync::mpsc::channel::<(Instant, Vec<u8>)>(100);
+    let expected = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let producer_expected = Arc::clone(&expected);
     let started = Instant::now();
     let producer = tokio::spawn(async move {
         let mut dropped = 0_u64;
@@ -233,8 +235,12 @@ async fn logger_fanout(run: usize) -> Result<()> {
             let mut line = format!("marker={marker:04} ").into_bytes();
             line.resize(LOG_MESSAGE_BYTES, b'l');
             line.push(b'\n');
-            if tx.try_send((Instant::now(), line)).is_err() {
-                dropped += 1;
+            match tx.try_reserve() {
+                Ok(permit) => {
+                    producer_expected.lock().unwrap().extend_from_slice(&line);
+                    permit.send((Instant::now(), line));
+                }
+                Err(_) => dropped += 1,
             }
             tokio::task::yield_now().await;
         }
@@ -265,9 +271,12 @@ async fn logger_fanout(run: usize) -> Result<()> {
     let file_latency = started.elapsed();
     let dropped = producer.await?;
     drop(clients);
-    let (healthy_bytes, viewer_latency) = healthy_task.await??;
-    let output_equal =
-        fs::metadata(&log_path)?.len() as usize == delivered && healthy_bytes == delivered;
+    let (healthy_output, viewer_latency) = healthy_task.await??;
+    let expected = expected.lock().map_err(|_| "expected bytes poisoned")?;
+    let file_output = fs::read(&log_path)?;
+    let output_equal = delivered == expected.len()
+        && file_output.as_slice() == expected.as_slice()
+        && healthy_output.as_slice() == expected.as_slice();
     println!(
         "{}",
         json!({"case":"logger-fanout","run":run,"fixture_messages":LOG_MESSAGES,"fixture_message_bytes":LOG_MESSAGE_BYTES,"slow_clients":SLOW_CLIENTS,"file_log_latency_ms":ms(max_file_marker_latency),"healthy_viewer_latency_ms":ms(viewer_latency),"total_elapsed_ms":ms(file_latency),"dropped_messages":dropped,"output_equal":output_equal})
