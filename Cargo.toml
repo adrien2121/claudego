@@ -26,3 +26,7 @@ signal-hook = "0.4.4"
 [[bench]]
 name = "pty_hot_path"
 harness = false
+
+[[bench]]
+name = "runtime_candidates"
+harness = false
