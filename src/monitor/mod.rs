@@ -3,6 +3,7 @@ use crate::models::SharedAppState;
 use crate::resume::ResumeTarget;
 use crate::time_format::format_duration;
 use chrono::Local;
+use std::collections::HashMap;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
@@ -33,6 +34,7 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
         };
         log_to_file("[System] Event-driven file watcher active. Blocking until events arrive.");
         let mut next_log_time = Instant::now();
+        let mut scan_failure_logs = HashMap::new();
 
         // ── 3. Event loop ───────────────────────────────────────────────
         loop {
@@ -50,8 +52,14 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                 if now >= target {
                     if retry_exhausted {
                         let event_res = handle.rx.recv().await;
-                        handle_event_result(event_res, &mut handle, &state, &mut next_log_time)
-                            .await;
+                        handle_event_result(
+                            event_res,
+                            &mut handle,
+                            &state,
+                            &mut next_log_time,
+                            &mut scan_failure_logs,
+                        )
+                        .await;
                         continue;
                     }
                     runtime::handle_expiry(&state, &resume_target, target).await;
@@ -82,13 +90,20 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                         // Timer expired, loop will check if lockout is over or log progress.
                     }
                     event_res = handle.rx.recv() => {
-                        handle_event_result(event_res, &mut handle, &state, &mut next_log_time).await;
+                        handle_event_result(event_res, &mut handle, &state, &mut next_log_time, &mut scan_failure_logs).await;
                     }
                 }
             } else {
                 // --- No lockout, wait for a file event ---
                 let event_res = handle.rx.recv().await;
-                handle_event_result(event_res, &mut handle, &state, &mut next_log_time).await;
+                handle_event_result(
+                    event_res,
+                    &mut handle,
+                    &state,
+                    &mut next_log_time,
+                    &mut scan_failure_logs,
+                )
+                .await;
             }
         }
     });
@@ -99,12 +114,14 @@ async fn handle_event_result(
     handle: &mut WatcherHandle,
     state: &SharedAppState,
     next_log_time: &mut Instant,
+    scan_failure_logs: &mut HashMap<std::path::PathBuf, Instant>,
 ) {
     match event_res {
         Some(Ok(first_event)) => {
             let paths = events::debounce_events(first_event, &mut handle.rx).await;
             if !paths.is_empty() {
-                runtime::scan_and_update_state(paths, state, next_log_time).await;
+                runtime::scan_and_update_state(paths, state, next_log_time, scan_failure_logs)
+                    .await;
             }
         }
         Some(Err(_)) => { /* A notify error occurred, but the channel is fine. Continue. */ }

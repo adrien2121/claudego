@@ -4,8 +4,9 @@ use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
 use crate::resume::{ResumeOutcome, ResumeTarget};
 use chrono::{DateTime, Local};
 use memmap2;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
@@ -16,6 +17,7 @@ const MAX_PREVIEW_CONTENT_SIZE: usize = 1_048_576;
 /// When scanning a modified file, re-scan this many bytes from the end of the
 /// previously seen content to be robust against missed initial detections.
 const SCAN_OVERLAP_BYTES: u64 = 4096;
+const SCAN_FAILURE_LOG_INTERVAL: Duration = Duration::from_secs(30);
 const RESUME_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -24,6 +26,117 @@ const RESUME_RETRY_DELAYS: [Duration; 3] = [
 
 trait ResumeAttempt {
     fn resume(&self) -> ResumeOutcome;
+}
+
+struct StableScan {
+    new_size: u64,
+    limit: Option<crate::watcher::scan::ActiveRateLimitInfo>,
+    preview: Option<String>,
+}
+
+#[derive(Debug)]
+enum ScanFailure {
+    Open(std::io::Error),
+    Metadata(std::io::Error),
+    Mmap(std::io::Error),
+    InvalidUtf8,
+    Changed,
+}
+
+impl std::fmt::Display for ScanFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Open(error) => write!(formatter, "open failed: {error}"),
+            Self::Metadata(error) => write!(formatter, "metadata failed: {error}"),
+            Self::Mmap(error) => write!(formatter, "mmap failed: {error}"),
+            Self::InvalidUtf8 => formatter.write_str("new content is invalid UTF-8"),
+            Self::Changed => formatter.write_str("file changed during scan; retrying"),
+        }
+    }
+}
+
+fn scan_mmap_range(
+    file: &File,
+    old_size: u64,
+    new_size: u64,
+) -> Result<
+    (
+        Option<crate::watcher::scan::ActiveRateLimitInfo>,
+        Option<String>,
+    ),
+    ScanFailure,
+> {
+    // Safety: the file is opened read-only and the captured range is bounds-checked
+    // before slicing, so concurrent truncation is reported instead of panicking.
+    let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(ScanFailure::Mmap)?;
+    if new_size > mmap.len() as u64 {
+        return Err(ScanFailure::Changed);
+    }
+    let scan_start = old_size.saturating_sub(SCAN_OVERLAP_BYTES).min(new_size);
+    let scan_slice = &mmap[scan_start as usize..new_size as usize];
+    let scan_str = std::str::from_utf8(scan_slice).map_err(|_| ScanFailure::InvalidUtf8)?;
+    let new_content_offset = old_size.saturating_sub(scan_start) as usize;
+    let preview = (new_content_offset < scan_str.len()).then(|| {
+        let content = &scan_str[new_content_offset..];
+        let preview_len = content.len().min(MAX_PREVIEW_CONTENT_SIZE);
+        crate::monitor::formatters::create_content_preview(&content[..preview_len])
+    });
+    Ok((
+        crate::watcher::scan::scan_content_for_limit(scan_str),
+        preview,
+    ))
+}
+
+fn scan_stable_range_with(
+    path: &Path,
+    old_size: u64,
+    after_scan: impl FnOnce(),
+) -> Result<StableScan, ScanFailure> {
+    let file = File::open(path).map_err(ScanFailure::Open)?;
+    let before = file.metadata().map_err(ScanFailure::Metadata)?;
+    let new_size = before.len();
+    let modified = before.modified().map_err(ScanFailure::Metadata)?;
+    let (limit, preview) = if new_size > old_size {
+        scan_mmap_range(&file, old_size, new_size)?
+    } else {
+        (None, None)
+    };
+    after_scan();
+    let after = file.metadata().map_err(ScanFailure::Metadata)?;
+    if after.len() != new_size || after.modified().map_err(ScanFailure::Metadata)? != modified {
+        return Err(ScanFailure::Changed);
+    }
+    Ok(StableScan {
+        new_size,
+        limit,
+        preview,
+    })
+}
+
+fn scan_stable_range(path: &Path, old_size: u64) -> Result<StableScan, ScanFailure> {
+    scan_stable_range_with(path, old_size, || {})
+}
+
+fn scan_one_path(path: &Path, state: &SharedAppState) -> Result<StableScan, ScanFailure> {
+    let old_size = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .file_size_cache
+        .get(path)
+        .copied()
+        .unwrap_or(0);
+    let scan = scan_stable_range(path, old_size)?;
+    state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .file_size_cache
+        .insert(path.to_path_buf(), scan.new_size);
+    Ok(scan)
+}
+
+#[cfg(test)]
+fn scan_mmap_range_for_test(file: &File, old_size: u64, new_size: u64) -> Result<(), ScanFailure> {
+    scan_mmap_range(file, old_size, new_size).map(|_| ())
 }
 
 impl ResumeAttempt for ResumeTarget {
@@ -37,6 +150,7 @@ pub(super) async fn scan_and_update_state(
     paths: HashSet<PathBuf>,
     state: &SharedAppState,
     next_log_time: &mut Instant,
+    failure_logs: &mut HashMap<PathBuf, Instant>,
 ) {
     // --- Busy-Wait Logic ---
     // Before scanning, check if the PTY is actively streaming. If so, wait.
@@ -66,113 +180,31 @@ pub(super) async fn scan_and_update_state(
     ));
 
     for path in paths {
-        let old_size = state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .file_size_cache
-            .get(&path)
-            .copied()
-            .unwrap_or(0); // If not in cache, this is the first time we see it.
-
-        let mtime_before = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-        let new_size = std::fs::metadata(&path)
-            .map(|m| m.len())
-            .unwrap_or(old_size);
-
-        if new_size <= old_size {
-            continue;
-        }
-
-        let mtime_after = std::fs::metadata(&path)
-            .ok()
-            .and_then(|m| m.modified().ok());
-
-        // If the file was modified during our read, we abort processing for this cycle.
-        // The file watcher has already picked up the new change, which will trigger a
-        // new scan after the debounce period. This ensures we only act on stable data.
-        if mtime_before.is_some() && mtime_before != mtime_after {
-            log_to_file(&format!(
-                "[Scan Aborted] Concurrent modification of {}. Rescheduling scan.",
-                path.display()
-            ));
-            continue;
-        }
-
-        // --- Single-Pass Scan & Preview using Memory-Mapping ---
-        // We use a memory map for a highly efficient, single-pass operation.
-        // This avoids multiple file reads and complex buffer management.
-        let limit_opt = match std::fs::File::open(&path) {
-            Ok(file) => {
-                // Safety: File is read-only. OS handles paging.
-                match unsafe { memmap2::Mmap::map(&file) } {
-                    Ok(mmap) => {
-                        // To be robust, we don't just scan the new content. We re-scan a small
-                        // portion of the old content as well. This helps if the initial scan
-                        // missed a limit that was at the very end of the file at startup.
-                        let scan_start = old_size.saturating_sub(SCAN_OVERLAP_BYTES);
-                        let scan_slice = &mmap[scan_start as usize..new_size as usize];
-
-                        match std::str::from_utf8(scan_slice) {
-                            Ok(scan_str) => {
-                                // 1. Generate a preview for logging. The preview should only
-                                //    show the *truly new* content, not the overlap.
-                                let new_content_offset =
-                                    old_size.saturating_sub(scan_start) as usize;
-                                if new_content_offset < scan_str.len() {
-                                    let new_content_for_preview = &scan_str[new_content_offset..];
-                                    let preview_len =
-                                        new_content_for_preview.len().min(MAX_PREVIEW_CONTENT_SIZE);
-                                    let content_preview =
-                                        crate::monitor::formatters::create_content_preview(
-                                            &new_content_for_preview[..preview_len],
-                                        );
-                                    log_with_content(
-                                        &format!("[File Content] New data in {}:", path.display()),
-                                        content_preview,
-                                    );
-                                }
-
-                                // 2. Scan the entire slice (including overlap) for a rate limit.
-                                crate::watcher::scan::scan_content_for_limit(scan_str)
-                            }
-                            Err(_) => {
-                                log_to_file(&format!(
-                                    "[Scan Warning] Invalid UTF-8 in new content of {}. Skipping.",
-                                    path.display()
-                                ));
-                                None
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        log_to_file(&format!(
-                            "[Scan Error] Failed to mmap {}: {}",
-                            path.display(),
-                            e
-                        ));
-                        None
-                    }
-                }
+        let StableScan { limit, preview, .. } = match scan_one_path(&path, state) {
+            Ok(scan) => {
+                failure_logs.remove(&path);
+                scan
             }
-            Err(e) => {
-                log_to_file(&format!(
-                    "[Scan Error] Failed to open {}: {}",
-                    path.display(),
-                    e
-                ));
-                None
+            Err(failure) => {
+                let now = Instant::now();
+                if failure_logs
+                    .get(&path)
+                    .is_none_or(|last| now.duration_since(*last) >= SCAN_FAILURE_LOG_INTERVAL)
+                {
+                    log_to_file(&format!("[Scan Error] {}: {failure}", path.display()));
+                    failure_logs.insert(path, now);
+                }
+                continue;
             }
         };
-
-        // --- Update State ---
-        {
-            let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
-            app.file_size_cache.insert(path, new_size);
+        if let Some(content_preview) = preview {
+            log_with_content(
+                &format!("[File Content] New data in {}:", path.display()),
+                content_preview,
+            );
         }
 
-        if let Some(limit_info) = limit_opt {
+        if let Some(limit_info) = limit {
             // These logs were previously inside `watcher::scan::parse_rate_limit_line`.
             // Moving them here makes the parser a pure function.
             log_to_file("  [MATCH] Active 'rate_limit' row found! Parsing contents...");
@@ -257,7 +289,10 @@ async fn handle_expiry_with<R: ResumeAttempt>(
 
 #[cfg(test)]
 mod tests {
-    use super::{handle_expiry_with, record_lockout, scan_and_update_state};
+    use super::{
+        handle_expiry_with, record_lockout, scan_and_update_state, scan_mmap_range_for_test,
+        scan_one_path, ScanFailure,
+    };
     use crate::models::AppState;
     use crate::resume::ResumeOutcome;
     use crate::watcher::scan::ActiveRateLimitInfo;
@@ -268,6 +303,97 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    fn unique_path(name: &str) -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "claudego-runtime-{}-{unique}-{name}",
+            std::process::id()
+        ))
+    }
+
+    fn state_with_cursor(path: std::path::PathBuf, cursor: u64) -> Arc<Mutex<AppState>> {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        state.lock().unwrap().file_size_cache.insert(path, cursor);
+        state
+    }
+
+    #[test]
+    fn failed_scan_does_not_advance_cursor() {
+        let path = unique_path("missing.jsonl");
+        let state = state_with_cursor(path.clone(), 17);
+        let result = scan_one_path(&path, &state);
+        assert!(result.is_err());
+        assert_eq!(state.lock().unwrap().file_size_cache[&path], 17);
+    }
+
+    #[test]
+    fn truncated_captured_range_is_retryable_not_a_panic() {
+        let path = unique_path("truncated.jsonl");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let result = scan_mmap_range_for_test(&file, 0, 20);
+        assert!(matches!(result, Err(ScanFailure::Changed)));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_append_is_retryable_then_commits_and_detects_limit() {
+        let path = unique_path("append.jsonl");
+        std::fs::write(&path, b"{\"type\":\"baseline\"}\n").unwrap();
+        let old_size = std::fs::metadata(&path).unwrap().len();
+        let state = state_with_cursor(path.clone(), old_size);
+        let now = Local::now();
+        let reset = (now + Duration::hours(2)).format("%-I:%M%P");
+        let row = format!(
+            "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"You've hit your session limit · resets {reset} (America/Toronto)\"}}]}}}}\n",
+            now.to_rfc3339()
+        );
+
+        let first = super::scan_stable_range_with(&path, old_size, || {
+            OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap()
+                .write_all(row.as_bytes())
+                .unwrap();
+        });
+        assert!(matches!(first, Err(ScanFailure::Changed)));
+        assert_eq!(state.lock().unwrap().file_size_cache[&path], old_size);
+
+        let retry = scan_one_path(&path, &state).unwrap();
+        assert!(retry.limit.is_some());
+        assert_eq!(
+            state.lock().unwrap().file_size_cache[&path],
+            std::fs::metadata(&path).unwrap().len()
+        );
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn scan_truncation_is_retryable_then_commits_reduced_length() {
+        let path = unique_path("truncate.jsonl");
+        std::fs::write(&path, b"0123456789").unwrap();
+        let state = state_with_cursor(path.clone(), 4);
+
+        let first = super::scan_stable_range_with(&path, 4, || {
+            OpenOptions::new()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_len(3)
+                .unwrap();
+        });
+        assert!(matches!(first, Err(ScanFailure::Changed)));
+        assert_eq!(state.lock().unwrap().file_size_cache[&path], 4);
+
+        scan_one_path(&path, &state).unwrap();
+        assert_eq!(state.lock().unwrap().file_size_cache[&path], 3);
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[derive(Clone)]
     struct ScriptedResume {
@@ -444,7 +570,13 @@ mod tests {
             .unwrap();
 
         let mut next_log_time = Instant::now();
-        scan_and_update_state(HashSet::from([path.clone()]), &state, &mut next_log_time).await;
+        scan_and_update_state(
+            HashSet::from([path.clone()]),
+            &state,
+            &mut next_log_time,
+            &mut std::collections::HashMap::new(),
+        )
+        .await;
 
         let app = state.lock().unwrap();
         assert_eq!(app.lockout_revision, 1);
