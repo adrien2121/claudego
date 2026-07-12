@@ -1,12 +1,12 @@
 use crate::logging::{log_to_file, log_with_content};
 use crate::models::{output_is_hot, SharedAppState};
 use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
-use crate::resume::ResumeTarget;
+use crate::resume::{ResumeOutcome, ResumeTarget};
 use chrono::{DateTime, Local};
 use memmap2;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 /// To prevent unbounded memory usage when a log file has a very large amount of new
@@ -16,6 +16,21 @@ const MAX_PREVIEW_CONTENT_SIZE: usize = 1_048_576;
 /// When scanning a modified file, re-scan this many bytes from the end of the
 /// previously seen content to be robust against missed initial detections.
 const SCAN_OVERLAP_BYTES: u64 = 4096;
+const RESUME_RETRY_DELAYS: [Duration; 3] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+];
+
+trait ResumeAttempt {
+    fn resume(&self) -> ResumeOutcome;
+}
+
+impl ResumeAttempt for ResumeTarget {
+    fn resume(&self) -> ResumeOutcome {
+        ResumeTarget::resume(self)
+    }
+}
 
 /// Scans a set of changed paths and updates the application state.
 pub(super) async fn scan_and_update_state(
@@ -190,40 +205,207 @@ pub(super) fn record_lockout(
 }
 
 /// Handles the logic for when a lockout expires.
-pub(super) fn handle_expiry(
+pub(super) async fn handle_expiry(
     state: &SharedAppState,
     resume_target: &ResumeTarget,
     expired_target: DateTime<Local>,
 ) {
+    handle_expiry_with(state, expired_target, resume_target.clone()).await;
+}
+
+async fn handle_expiry_with<R: ResumeAttempt>(
+    state: &SharedAppState,
+    expired_target: DateTime<Local>,
+    resume_target: R,
+) {
+    let expired_revision = state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .lockout_revision;
     log_to_file("[Trigger] Reset time reached. Injecting 'continue' command…");
-    match resume_target.resume() {
-        Ok(()) => log_to_file("[System] Resume command sent."),
-        Err(error) => log_to_file(&format!("[Resume Error] {error}")),
+    let mut outcome = resume_target.resume();
+    for delay in RESUME_RETRY_DELAYS {
+        match outcome {
+            ResumeOutcome::Sent | ResumeOutcome::AmbiguousFailure(_) => break,
+            ResumeOutcome::DefiniteFailure(ref error) => {
+                log_to_file(&format!("[Resume Error] {error}"));
+                sleep(delay).await;
+                outcome = resume_target.resume();
+            }
+        }
     }
+
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    // Atomically check and set: only clear the lockout if it's the one we just handled.
-    // This prevents a race condition where a new lockout is detected right as an old one expires.
-    if s.lockout_target_time == Some(expired_target) {
-        s.lockout_target_time = None;
-        s.file_size_cache.clear();
-        log_to_file("[System] Resuming passive file monitoring.");
-    } else {
-        // Another lockout was set in the meantime. Don't clear it.
-        log_to_file("[System] Expiry handled, but a newer lockout has already been detected. State not cleared.");
+    let still_current =
+        s.lockout_target_time == Some(expired_target) && s.lockout_revision == expired_revision;
+    match outcome {
+        ResumeOutcome::Sent if still_current => {
+            log_to_file("[System] Resume command sent.");
+            s.lockout_target_time = None;
+            s.file_size_cache.clear();
+            log_to_file("[System] Resuming passive file monitoring.");
+        }
+        ResumeOutcome::Sent => log_to_file("[System] Expiry handled, but a newer lockout has already been detected. State not cleared."),
+        ResumeOutcome::DefiniteFailure(error) | ResumeOutcome::AmbiguousFailure(error) => {
+            log_to_file(&format!("[Resume Error] {error}"));
+            if still_current {
+                s.resume_exhausted_revision = Some(expired_revision);
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{record_lockout, scan_and_update_state};
+    use super::{handle_expiry_with, record_lockout, scan_and_update_state};
     use crate::models::AppState;
+    use crate::resume::ResumeOutcome;
     use crate::watcher::scan::ActiveRateLimitInfo;
     use chrono::{Duration, Local};
     use std::collections::HashSet;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[derive(Clone)]
+    struct ScriptedResume {
+        attempts: Arc<AtomicUsize>,
+        outcomes: Arc<Mutex<Vec<ResumeOutcome>>>,
+    }
+
+    impl ScriptedResume {
+        fn outcomes(outcomes: Vec<ResumeOutcome>) -> Self {
+            Self {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                outcomes: Arc::new(Mutex::new(outcomes)),
+            }
+        }
+
+        fn definite_failures(count: usize) -> Self {
+            Self::outcomes(vec![
+                ResumeOutcome::DefiniteFailure(
+                    "runner unavailable".to_string()
+                );
+                count
+            ])
+        }
+
+        fn resume(&self) -> ResumeOutcome {
+            self.attempts.fetch_add(1, Ordering::Relaxed);
+            self.outcomes.lock().unwrap().remove(0)
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(Ordering::Relaxed)
+        }
+    }
+
+    impl super::ResumeAttempt for ScriptedResume {
+        fn resume(&self) -> ResumeOutcome {
+            self.resume()
+        }
+    }
+
+    fn shared_state_with_lockout(
+        target: chrono::DateTime<Local>,
+        revision: u64,
+    ) -> Arc<Mutex<AppState>> {
+        let mut app = AppState::new();
+        app.lockout_target_time = Some(target);
+        app.lockout_revision = revision;
+        Arc::new(Mutex::new(app))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn three_retries_retain_lockout_and_mark_revision_exhausted() {
+        let target = Local::now();
+        let state = shared_state_with_lockout(target, 3);
+        let resume = ScriptedResume::definite_failures(4);
+        let task_state = Arc::clone(&state);
+        let task_resume = resume.clone();
+        let task =
+            tokio::spawn(async move { handle_expiry_with(&task_state, target, task_resume).await });
+        tokio::time::advance(std::time::Duration::from_secs(7)).await;
+        task.await.unwrap();
+
+        let app = state.lock().unwrap();
+        assert_eq!(resume.attempts(), 4);
+        assert_eq!(app.lockout_target_time, Some(target));
+        assert_eq!(app.resume_exhausted_revision, Some(3));
+    }
+
+    #[tokio::test]
+    async fn resume_success_clears_matching_lockout_and_cache() {
+        let target = Local::now();
+        let state = shared_state_with_lockout(target, 3);
+        state
+            .lock()
+            .unwrap()
+            .file_size_cache
+            .insert(std::path::PathBuf::from("session.jsonl"), 42);
+        let resume = ScriptedResume::outcomes(vec![ResumeOutcome::Sent]);
+
+        handle_expiry_with(&state, target, resume.clone()).await;
+
+        let app = state.lock().unwrap();
+        assert_eq!(resume.attempts(), 1);
+        assert_eq!(app.lockout_target_time, None);
+        assert!(app.file_size_cache.is_empty());
+        assert_eq!(app.resume_exhausted_revision, None);
+    }
+
+    #[tokio::test]
+    async fn resume_ambiguity_stops_and_marks_revision_exhausted() {
+        let target = Local::now();
+        let state = shared_state_with_lockout(target, 3);
+        let resume = ScriptedResume::outcomes(vec![ResumeOutcome::AmbiguousFailure(
+            "flush uncertain".to_string(),
+        )]);
+
+        handle_expiry_with(&state, target, resume.clone()).await;
+
+        let app = state.lock().unwrap();
+        assert_eq!(resume.attempts(), 1);
+        assert_eq!(app.lockout_target_time, Some(target));
+        assert_eq!(app.resume_exhausted_revision, Some(3));
+    }
+
+    struct ReplacingResume {
+        state: Arc<Mutex<AppState>>,
+        replacement: chrono::DateTime<Local>,
+    }
+
+    impl super::ResumeAttempt for ReplacingResume {
+        fn resume(&self) -> ResumeOutcome {
+            let mut app = self.state.lock().unwrap();
+            app.lockout_revision += 1;
+            app.lockout_target_time = Some(self.replacement);
+            ResumeOutcome::Sent
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_success_does_not_clear_newer_revision() {
+        let target = Local::now();
+        let replacement = target + Duration::minutes(30);
+        let state = shared_state_with_lockout(target, 3);
+
+        handle_expiry_with(
+            &state,
+            target,
+            ReplacingResume {
+                state: Arc::clone(&state),
+                replacement,
+            },
+        )
+        .await;
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_revision, 4);
+        assert_eq!(app.lockout_target_time, Some(replacement));
+    }
 
     #[tokio::test]
     async fn direct_scan_records_one_file_watcher_lockout_from_new_content() {

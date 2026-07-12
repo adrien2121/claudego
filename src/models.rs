@@ -9,6 +9,7 @@ pub struct AppState {
     pub lockout_target_time: Option<chrono::DateTime<chrono::Local>>,
     /// Increments for live stream/file events; startup scan establishes baseline state.
     pub lockout_revision: u64,
+    pub resume_exhausted_revision: Option<u64>,
     pub file_size_cache: HashMap<PathBuf, u64>,
     pub last_output_activity: OutputActivity,
 }
@@ -18,6 +19,7 @@ impl AppState {
         Self {
             lockout_target_time: None,
             lockout_revision: 0,
+            resume_exhausted_revision: None,
             file_size_cache: HashMap::new(),
             last_output_activity: Arc::new(AtomicU64::new(0)),
         }
@@ -80,5 +82,17 @@ mod tests {
             &state.last_output_activity,
             Duration::from_secs(2)
         ));
+    }
+
+    #[test]
+    fn new_lockout_revision_is_not_exhausted() {
+        let mut state = AppState::new();
+        state.resume_exhausted_revision = Some(7);
+        state.lockout_revision = 8;
+
+        assert_ne!(
+            state.resume_exhausted_revision,
+            Some(state.lockout_revision)
+        );
     }
 }

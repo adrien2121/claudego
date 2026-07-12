@@ -7,6 +7,13 @@ pub enum StreamResumeCommand {
     Continue,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    Sent,
+    DefiniteFailure(String),
+    AmbiguousFailure(String),
+}
+
 #[derive(Clone)]
 pub enum ResumeTarget {
     Pty(SharedPtyWriter),
@@ -14,27 +21,35 @@ pub enum ResumeTarget {
 }
 
 impl ResumeTarget {
-    pub fn resume(&self) -> Result<(), String> {
+    pub fn resume(&self) -> ResumeOutcome {
         match self {
             ResumeTarget::Pty(writer) => {
                 let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
-                writer
-                    .write_all(b"continue\r")
-                    .map_err(|e| format!("failed to write PTY continue command: {e}"))?;
-                writer
-                    .flush()
-                    .map_err(|e| format!("failed to flush PTY continue command: {e}"))
+                if let Err(error) = writer.write_all(b"continue\r") {
+                    return ResumeOutcome::AmbiguousFailure(format!(
+                        "failed to write PTY continue command: {error}"
+                    ));
+                }
+                match writer.flush() {
+                    Ok(()) => ResumeOutcome::Sent,
+                    Err(error) => ResumeOutcome::AmbiguousFailure(format!(
+                        "failed to flush PTY continue command: {error}"
+                    )),
+                }
             }
-            ResumeTarget::StreamJson(tx) => tx
-                .send(StreamResumeCommand::Continue)
-                .map_err(|_| "stream-json runner is no longer available".to_string()),
+            ResumeTarget::StreamJson(tx) => match tx.send(StreamResumeCommand::Continue) {
+                Ok(()) => ResumeOutcome::Sent,
+                Err(_) => ResumeOutcome::DefiniteFailure(
+                    "stream-json runner is no longer available".to_string(),
+                ),
+            },
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ResumeTarget, StreamResumeCommand};
+    use super::{ResumeOutcome, ResumeTarget, StreamResumeCommand};
     use crate::pty_bridge::SharedPtyWriter;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
@@ -64,7 +79,7 @@ mod tests {
         };
         let writer: SharedPtyWriter = Arc::new(Mutex::new(Box::new(writer)));
 
-        ResumeTarget::Pty(writer).resume().expect("resume succeeds");
+        assert_eq!(ResumeTarget::Pty(writer).resume(), ResumeOutcome::Sent);
 
         assert_eq!(&*bytes.lock().unwrap(), b"continue\r");
     }
@@ -73,10 +88,19 @@ mod tests {
     async fn stream_resume_sends_continue_command() {
         let (tx, mut rx) = mpsc::unbounded_channel();
 
-        ResumeTarget::StreamJson(tx)
-            .resume()
-            .expect("resume succeeds");
+        assert_eq!(ResumeTarget::StreamJson(tx).resume(), ResumeOutcome::Sent);
 
         assert_eq!(rx.recv().await, Some(StreamResumeCommand::Continue));
+    }
+
+    #[tokio::test]
+    async fn closed_stream_is_a_definite_failure() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        drop(rx);
+
+        assert_eq!(
+            ResumeTarget::StreamJson(tx).resume(),
+            ResumeOutcome::DefiniteFailure("stream-json runner is no longer available".to_string())
+        );
     }
 }

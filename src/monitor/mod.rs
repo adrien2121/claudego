@@ -36,18 +36,25 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
 
         // ── 3. Event loop ───────────────────────────────────────────────
         loop {
-            let lockout_target = {
-                state
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .lockout_target_time
+            let (lockout_target, retry_exhausted) = {
+                let app = state.lock().unwrap_or_else(|e| e.into_inner());
+                (
+                    app.lockout_target_time,
+                    app.resume_exhausted_revision == Some(app.lockout_revision),
+                )
             };
 
             if let Some(target) = lockout_target {
                 // --- Lockout is ACTIVE ---
                 let now = Local::now();
                 if now >= target {
-                    runtime::handle_expiry(&state, &resume_target, target);
+                    if retry_exhausted {
+                        let event_res = handle.rx.recv().await;
+                        handle_event_result(event_res, &mut handle, &state, &mut next_log_time)
+                            .await;
+                        continue;
+                    }
+                    runtime::handle_expiry(&state, &resume_target, target).await;
                     continue; // Re-evaluate state immediately
                 }
 
