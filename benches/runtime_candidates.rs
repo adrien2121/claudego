@@ -15,8 +15,8 @@ use tokio::sync::Mutex;
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const STARTUP_FILES: usize = 256;
 const STARTUP_FILE_BYTES: usize = 256 * 1024;
-const LOG_MESSAGES: usize = 16;
-const LOG_MESSAGE_BYTES: usize = 1024 * 1024;
+const LOG_MESSAGES: usize = 512;
+const LOG_MESSAGE_BYTES: usize = 32 * 1024;
 const SLOW_CLIENTS: usize = 4;
 const STREAM_CHUNKS: usize = 512;
 const STREAM_CHUNK_BYTES: usize = 8192;
@@ -39,7 +39,7 @@ impl Drop for Scratch {
     }
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+#[tokio::main(flavor = "current_thread")]
 async fn main() {
     if let Err(error) = run().await {
         eprintln!("runtime_candidates: {error}");
@@ -73,7 +73,11 @@ async fn run() -> Result<()> {
 async fn startup_scan(run: usize) -> Result<()> {
     let scratch = Scratch::new("startup", run)?;
     let projects = scratch.0.join("home/.claude/projects/bench");
+    let tmp = scratch.0.join("tmp");
     fs::create_dir_all(&projects)?;
+    fs::create_dir_all(&tmp)?;
+    std::env::set_var("HOME", scratch.0.join("home"));
+    std::env::set_var("TMPDIR", &tmp);
     let line = vec![b'x'; STARTUP_FILE_BYTES];
     for index in 0..STARTUP_FILES {
         fs::write(projects.join(format!("session-{index}.jsonl")), &line)?;
@@ -81,10 +85,12 @@ async fn startup_scan(run: usize) -> Result<()> {
 
     let max_delay = Arc::new(Mutex::new(Duration::ZERO));
     let observed = Arc::clone(&max_delay);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let ticker = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_millis(1));
         interval.tick().await;
         let mut previous = Instant::now();
+        let _ = ready_tx.send(());
         for _ in 0..200 {
             interval.tick().await;
             let now = Instant::now();
@@ -96,9 +102,11 @@ async fn startup_scan(run: usize) -> Result<()> {
             previous = now;
         }
     });
-    tokio::task::yield_now().await;
+    ready_rx.await?;
     let started = Instant::now();
-    let bytes = synchronous_initial_scan(&projects)?;
+    let discovered = PathBuf::from(std::env::var_os("HOME").ok_or("HOME missing")?)
+        .join(".claude/projects/bench");
+    let bytes = synchronous_initial_scan(&discovered)?;
     let elapsed = started.elapsed();
     ticker.await?;
     println!(
@@ -141,40 +149,54 @@ async fn logger_fanout(run: usize) -> Result<()> {
     for _ in 0..=SLOW_CLIENTS {
         clients.push(listener.accept().await?.0);
     }
-    let expected = LOG_MESSAGES * (LOG_MESSAGE_BYTES + 1);
     let healthy_task = tokio::spawn(async move {
         let started = Instant::now();
         let mut bytes = 0;
         let mut buffer = vec![0; 64 * 1024];
-        while bytes < expected {
-            bytes += healthy_read.read(&mut buffer).await?;
+        loop {
+            let n = healthy_read.read(&mut buffer).await?;
+            if n == 0 {
+                break;
+            }
+            bytes += n;
         }
         Ok::<_, std::io::Error>((bytes, started.elapsed()))
     });
-    let payload = vec![b'l'; LOG_MESSAGE_BYTES];
-    let mut line = payload.clone();
-    line.push(b'\n');
-    let started = Instant::now();
-    let mut file = tokio::fs::File::create(&log_path).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(100);
     let mut dropped = 0_u64;
     for _ in 0..LOG_MESSAGES {
-        for client in &mut clients {
-            if tokio::time::timeout(Duration::from_millis(100), client.write_all(&line))
-                .await
-                .is_err()
-            {
-                dropped += 1;
+        let mut line = vec![b'l'; LOG_MESSAGE_BYTES + 1];
+        line[LOG_MESSAGE_BYTES] = b'\n';
+        if tx.try_send(line).is_err() {
+            dropped += 1;
+        }
+    }
+    drop(tx);
+    let started = Instant::now();
+    let mut file = tokio::fs::File::create(&log_path).await?;
+    let mut delivered = 0_usize;
+    while let Some(line) = rx.recv().await {
+        let mut dead = Vec::new();
+        for (index, client) in clients.iter_mut().enumerate() {
+            if !matches!(
+                tokio::time::timeout(Duration::from_millis(100), client.write_all(&line)).await,
+                Ok(Ok(()))
+            ) {
+                dead.push(index);
             }
         }
-        file.write_all(&payload).await?;
-        file.write_all(b"\n").await?;
+        for index in dead.into_iter().rev() {
+            clients.remove(index);
+        }
+        file.write_all(&line).await?;
+        delivered += line.len();
     }
     file.flush().await?;
     let file_latency = started.elapsed();
     drop(clients);
     let (healthy_bytes, viewer_latency) = healthy_task.await??;
     let output_equal =
-        fs::metadata(&log_path)?.len() as usize == expected && healthy_bytes == expected;
+        fs::metadata(&log_path)?.len() as usize == delivered && healthy_bytes == delivered;
     println!(
         "{}",
         json!({"case":"logger-fanout","run":run,"fixture_messages":LOG_MESSAGES,"fixture_message_bytes":LOG_MESSAGE_BYTES,"slow_clients":SLOW_CLIENTS,"file_log_latency_ms":ms(file_latency),"healthy_viewer_latency_ms":ms(viewer_latency),"dropped_messages":dropped,"output_equal":output_equal})
@@ -188,8 +210,15 @@ async fn stream_flush(run: usize) -> Result<()> {
         .map(|i| vec![(i % 251) as u8; STREAM_CHUNK_BYTES])
         .collect();
     let expected: Vec<u8> = chunks.concat();
-    let per_read = measure_stream(&chunks, true).await?;
-    let buffered = measure_stream(&chunks, false).await?;
+    let (per_read, buffered) = if run.is_multiple_of(2) {
+        let buffered = measure_stream(&chunks, false).await?;
+        let per_read = measure_stream(&chunks, true).await?;
+        (per_read, buffered)
+    } else {
+        let per_read = measure_stream(&chunks, true).await?;
+        let buffered = measure_stream(&chunks, false).await?;
+        (per_read, buffered)
+    };
     println!(
         "{}",
         json!({"case":"stream-flush","run":run,"fixture_chunks":STREAM_CHUNKS,"fixture_bytes":expected.len(),"per_read_flush":{"throughput_mib_s":mib_s(expected.len(),per_read.0),"first_byte_latency_ms":ms(per_read.1),"max_inter_chunk_latency_ms":ms(per_read.2)},"no_per_read_flush":{"throughput_mib_s":mib_s(expected.len(),buffered.0),"first_byte_latency_ms":ms(buffered.1),"max_inter_chunk_latency_ms":ms(buffered.2)},"output_equal":per_read.3 == expected && buffered.3 == expected})

@@ -68,3 +68,71 @@ Implementation caveat: the production startup scan and stream pump are crate-pri
 - Startup scheduling: **retain current behavior**. Zero of nine runs exceeded 100 ms; the preserved maximum outlier was 2.978 ms.
 - Logger fan-out: **open a separately reviewed optimization plan** limited to documenting/enforcing one active viewer. All nine runs exceeded both 500 ms latency limits and reported timed-out client writes. Do not add per-client tasks or queues based on this benchmark.
 - Stream flushing: **open a separately reviewed optimization plan**. Exact output and both responsiveness limits passed in all runs. Median throughput improved from 4227.77 MiB/s to 4753.89 MiB/s (12.4%), exceeding the predeclared 10% threshold. Do not modify `pump_raw_output` without that separate review.
+
+## Review correction (supersedes the decisions above)
+
+The first measurement set failed causal review: startup used a second executor worker, logger counted socket timeouts instead of channel drops and retained dead clients, and the stream sink was not terminal-representative. Those records remain above as failed evidence; they are not used for decisions. No run failed to execute. Preserved outliers are the original startup 2.978 ms record and original stream per-read 1.847 ms gap.
+
+The corrected startup harness uses a current-thread runtime, synchronizes ticker readiness before scanning, routes `HOME` and `TMPDIR`, and discovers the fixture through `HOME`. The corrected logger uses the production-sized bounded channel, counts only full-channel drops, and removes timed-out clients. Stream variant order alternates, but the sink remains non-terminal-representative; its evidence is explicitly inconclusive.
+
+### Corrected startup raw records
+
+```ndjson
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":7.574833,"output_equal":true,"run":1,"scan_ms":8.553125}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":7.275166,"output_equal":true,"run":2,"scan_ms":8.248917}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":8.212041999999999,"output_equal":true,"run":3,"scan_ms":9.191625}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":8.264917,"output_equal":true,"run":4,"scan_ms":9.24075}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":8.041208,"output_equal":true,"run":5,"scan_ms":9.020375000000001}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":8.3615,"output_equal":true,"run":6,"scan_ms":9.338458}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":8.228625,"output_equal":true,"run":7,"scan_ms":9.202125}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":9.27725,"output_equal":true,"run":8,"scan_ms":10.254916}
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":9.181625,"output_equal":true,"run":9,"scan_ms":10.155042}
+```
+
+### Corrected logger raw records
+
+```ndjson
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":414.752291,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":414.818292,"output_equal":true,"run":1,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":414.681291,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":414.7355,"output_equal":true,"run":2,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":412.859125,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":412.91783300000003,"output_equal":true,"run":3,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":413.396792,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":413.43025,"output_equal":true,"run":4,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":415.01354200000003,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":415.0765,"output_equal":true,"run":5,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":412.185625,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":412.20708299999995,"output_equal":true,"run":6,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":412.982708,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":413.027291,"output_equal":true,"run":7,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":415.431959,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":415.493458,"output_equal":true,"run":8,"slow_clients":4}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":414.964125,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":415.05483300000003,"output_equal":true,"run":9,"slow_clients":4}
+```
+
+### Corrected stream raw records
+
+```ndjson
+{"case":"stream-flush","run":1,"per_read_flush":{"throughput_mib_s":2569.2492974708953},"no_per_read_flush":{"throughput_mib_s":2516.6460406551582},"output_equal":true}
+{"case":"stream-flush","run":2,"per_read_flush":{"throughput_mib_s":2659.132458035566},"no_per_read_flush":{"throughput_mib_s":2564.033532430537},"output_equal":true}
+{"case":"stream-flush","run":3,"per_read_flush":{"throughput_mib_s":2820.6258263552227},"no_per_read_flush":{"throughput_mib_s":2882.795619880335},"output_equal":true}
+{"case":"stream-flush","run":4,"per_read_flush":{"throughput_mib_s":2824.110846350719},"no_per_read_flush":{"throughput_mib_s":2864.047256779737},"output_equal":true}
+{"case":"stream-flush","run":5,"per_read_flush":{"throughput_mib_s":2678.421365231546},"no_per_read_flush":{"throughput_mib_s":2729.7549430743725},"output_equal":true}
+{"case":"stream-flush","run":6,"per_read_flush":{"throughput_mib_s":2741.368971129958},"no_per_read_flush":{"throughput_mib_s":2710.945442222975},"output_equal":true}
+{"case":"stream-flush","run":7,"per_read_flush":{"throughput_mib_s":2807.6736528606334},"no_per_read_flush":{"throughput_mib_s":2756.7974008914107},"output_equal":true}
+{"case":"stream-flush","run":8,"per_read_flush":{"throughput_mib_s":2726.2664870965805},"no_per_read_flush":{"throughput_mib_s":2812.939521800281},"output_equal":true}
+{"case":"stream-flush","run":9,"per_read_flush":{"throughput_mib_s":2600.780234070221},"no_per_read_flush":{"throughput_mib_s":2867.2992406674784},"output_equal":true}
+```
+
+The full latency fields remain in the command capture and Task 7 report. These records do not support a production decision because `DuplexStream::flush` does not model stdout/terminal buffering.
+
+### Corrected decisions
+
+- Startup: **retain current behavior**. Corrected scheduling delay was 7.275–9.277 ms, below 100 ms. The replica still omits production state/logging work, so evidence is conservative but not end-to-end.
+- Logger: **retain current behavior; evidence inconclusive**. The harness now counts 412 full-channel drops and removes dead clients, but the burst producer lacks a no-slow-client attribution control.
+- Stream: **retain current behavior; evidence inconclusive**. Alternating order removes fixed-order bias, but the sink does not model terminal buffering and the replica omits parser/channel/activity work.
+
+### Verification and smoke evidence
+
+- `cargo fmt --check`: pass
+- `cargo test`: pass (57 tests across library, helper, and integrations)
+- `cargo clippy --all-targets --all-features -- -D warnings`: pass
+
+```ndjson
+{"case":"startup-scan","fixture_bytes":67108864,"fixture_files":256,"max_scheduling_delay_ms":6.157583000000001,"output_equal":true,"run":1,"scan_ms":7.137625}
+{"case":"logger-fanout","dropped_messages":412,"file_log_latency_ms":417.53191699999996,"fixture_message_bytes":32768,"fixture_messages":512,"healthy_viewer_latency_ms":417.625042,"output_equal":true,"run":1,"slow_clients":4}
+{"case":"stream-flush","fixture_bytes":4194304,"fixture_chunks":512,"no_per_read_flush":{"first_byte_latency_ms":0.047,"max_inter_chunk_latency_ms":0.047,"throughput_mib_s":2600.286551577984},"output_equal":true,"per_read_flush":{"first_byte_latency_ms":0.050083,"max_inter_chunk_latency_ms":0.050083,"throughput_mib_s":2605.298003755537},"run":1}
+```
