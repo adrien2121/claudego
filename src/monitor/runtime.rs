@@ -72,13 +72,23 @@ fn scan_mmap_range(
     if new_size > mmap.len() as u64 {
         return Err(ScanFailure::Changed);
     }
-    let scan_start = old_size.saturating_sub(SCAN_OVERLAP_BYTES).min(new_size);
-    let scan_slice = &mmap[scan_start as usize..new_size as usize];
+    let mut scan_start = old_size.saturating_sub(SCAN_OVERLAP_BYTES).min(new_size) as usize;
+    let new_size = new_size as usize;
+    while scan_start < new_size && mmap[scan_start] & 0b1100_0000 == 0b1000_0000 {
+        scan_start += 1;
+    }
+    let scan_slice = &mmap[scan_start..new_size];
     let scan_str = std::str::from_utf8(scan_slice).map_err(|_| ScanFailure::InvalidUtf8)?;
-    let new_content_offset = old_size.saturating_sub(scan_start) as usize;
+    let mut new_content_offset = (old_size as usize).saturating_sub(scan_start);
+    while new_content_offset < scan_str.len() && !scan_str.is_char_boundary(new_content_offset) {
+        new_content_offset += 1;
+    }
     let preview = (new_content_offset < scan_str.len()).then(|| {
         let content = &scan_str[new_content_offset..];
-        let preview_len = content.len().min(MAX_PREVIEW_CONTENT_SIZE);
+        let mut preview_len = content.len().min(MAX_PREVIEW_CONTENT_SIZE);
+        while !content.is_char_boundary(preview_len) {
+            preview_len -= 1;
+        }
         crate::monitor::formatters::create_content_preview(&content[..preview_len])
     });
     Ok((
@@ -232,6 +242,12 @@ pub(super) fn record_lockout(
         limit_info.display_str
     ));
     let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
+    if app
+        .lockout_target_time
+        .is_some_and(|current| current >= limit_info.target_time)
+    {
+        return;
+    }
     app.lockout_revision = app.lockout_revision.wrapping_add(1);
     app.lockout_target_time = Some(limit_info.target_time);
 }
@@ -607,5 +623,109 @@ mod tests {
         );
 
         assert_eq!(state.lock().unwrap().lockout_target_time, Some(target));
+    }
+
+    #[test]
+    fn rediscovered_lockout_does_not_create_a_new_revision_or_bypass_exhaustion() {
+        let target = Local::now() + Duration::minutes(30);
+        let state = shared_state_with_lockout(target, 7);
+        state.lock().unwrap().resume_exhausted_revision = Some(7);
+
+        record_lockout(
+            &state,
+            ActiveRateLimitInfo {
+                target_time: target,
+                display_str: "5:30pm".to_string(),
+                raw_message: "same target in an unrelated appended event".to_string(),
+            },
+            "file watcher",
+        );
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_revision, 7);
+        assert_eq!(app.resume_exhausted_revision, Some(7));
+        assert_eq!(app.lockout_target_time, Some(target));
+    }
+
+    #[test]
+    fn older_rediscovery_does_not_replace_a_materially_newer_target() {
+        let newer = Local::now() + Duration::hours(2);
+        let older = newer - Duration::hours(1);
+        let state = shared_state_with_lockout(newer, 9);
+
+        record_lockout(
+            &state,
+            ActiveRateLimitInfo {
+                target_time: older,
+                display_str: "older".to_string(),
+                raw_message: "older rediscovery".to_string(),
+            },
+            "file watcher",
+        );
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_revision, 9);
+        assert_eq!(app.lockout_target_time, Some(newer));
+    }
+
+    #[test]
+    fn newer_lockout_creates_a_new_revision() {
+        let older = Local::now() + Duration::minutes(30);
+        let newer = older + Duration::hours(1);
+        let state = shared_state_with_lockout(older, 9);
+
+        record_lockout(
+            &state,
+            ActiveRateLimitInfo {
+                target_time: newer,
+                display_str: "newer".to_string(),
+                raw_message: "newer target".to_string(),
+            },
+            "file watcher",
+        );
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_revision, 10);
+        assert_eq!(app.lockout_target_time, Some(newer));
+    }
+
+    #[test]
+    fn overlap_scan_aligns_to_utf8_character_boundaries() {
+        let path = unique_path("utf8-overlap.jsonl");
+        let prefix = "a".repeat(4095);
+        let content = format!("{prefix}é{{\"type\":\"event\"}}\n");
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let result = scan_mmap_range_for_test(&file, 4097, content.len() as u64);
+
+        assert!(result.is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preview_byte_cap_aligns_to_utf8_character_boundaries() {
+        let path = unique_path("utf8-preview.jsonl");
+        let content = format!("{}é", "a".repeat(super::MAX_PREVIEW_CONTENT_SIZE - 1));
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let result = scan_mmap_range_for_test(&file, 0, content.len() as u64);
+
+        assert!(result.is_ok());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn preview_offset_advances_when_cached_size_splits_a_character() {
+        let path = unique_path("utf8-preview-offset.jsonl");
+        let content = "é{\"type\":\"event\"}\n";
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let result = scan_mmap_range_for_test(&file, 1, content.len() as u64);
+
+        assert!(result.is_ok());
+        std::fs::remove_file(path).unwrap();
     }
 }

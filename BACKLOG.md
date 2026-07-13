@@ -47,11 +47,11 @@ monitor-idle median throughput: 230.76 MiB/s
 scan-deferred median throughput: 228.09 MiB/s
 ```
 
-PTY decision: TUNE the current bridge first by locking stdout once and enlarging its read buffer.
+PTY decision: OPEN a separately reviewed measurement plan with a controlled baseline before considering any production optimization. These results lack a control that isolates the proposed change, so they do not justify changing production behavior.
 
 Monitor decision: KEEP current deferral behavior; deferred work adds no measured boundary violation.
 
-Upgrade/replace decision: NOT JUSTIFIED; reconsider portable-pty only after the ordered local optimization and a full rerun still isolate bridge cost.
+Upgrade/replace decision: NOT JUSTIFIED; reconsider portable-pty only after the controlled measurement plan isolates bridge cost.
 
 ## P1 — Add end-to-end streaming stress coverage
 

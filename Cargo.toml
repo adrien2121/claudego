@@ -9,7 +9,7 @@ clap = { version = "4.5", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
 crossterm = "0.27"
 dirs = "5.0"
-tokio = { version = "1", features = ["full", "test-util"] }
+tokio = { version = "1", features = ["full"] }
 portable-pty = "0.8"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
@@ -22,6 +22,9 @@ memmap2 = "0.9"
 
 [target."cfg(unix)".dependencies]
 signal-hook = "0.4.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [[bench]]
 name = "pty_hot_path"
