@@ -137,4 +137,34 @@ mod tests {
             Local.with_ymd_and_hms(2026, 7, 5, 17, 0, 5).unwrap()
         );
     }
+
+    #[test]
+    fn rolls_11pm_event_with_2am_reset_to_next_day() {
+        let event = Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 0).unwrap();
+        let (target, _) = parse_reset_time(event, "Claude limit reached; resets 2am").unwrap();
+        assert_eq!(
+            target,
+            Local.with_ymd_and_hms(2026, 7, 13, 2, 0, 5).unwrap()
+        );
+    }
+
+    #[test]
+    fn rolls_1159pm_event_with_midnight_reset_to_next_day() {
+        let event = Local.with_ymd_and_hms(2026, 7, 12, 23, 59, 0).unwrap();
+        let (target, _) = parse_reset_time(event, "Claude limit reached; resets 12am").unwrap();
+        assert_eq!(
+            target,
+            Local.with_ymd_and_hms(2026, 7, 13, 0, 0, 5).unwrap()
+        );
+    }
+
+    #[test]
+    fn rolls_11pm_event_with_noon_reset_to_next_day() {
+        let event = Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 0).unwrap();
+        let (target, _) = parse_reset_time(event, "Claude limit reached; resets 12pm").unwrap();
+        assert_eq!(
+            target,
+            Local.with_ymd_and_hms(2026, 7, 13, 12, 0, 5).unwrap()
+        );
+    }
 }

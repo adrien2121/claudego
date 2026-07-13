@@ -20,6 +20,7 @@ mod models {
     pub struct AppState {
         pub file_size_cache: HashMap<PathBuf, u64>,
         pub lockout_target_time: Option<chrono::DateTime<chrono::Local>>,
+        pub latest_rate_limit_event_time: Option<chrono::DateTime<chrono::Local>>,
     }
     pub type SharedAppState = Arc<std::sync::Mutex<AppState>>;
 }
@@ -64,7 +65,8 @@ mod watcher {
         use chrono::{DateTime, Local};
         #[allow(dead_code)]
         #[derive(Debug)]
-        pub struct ActiveRateLimitInfo {
+        pub struct RateLimitInfo {
+            pub event_time: DateTime<Local>,
             pub target_time: DateTime<Local>,
             pub display_str: String,
             pub raw_message: String,
@@ -72,8 +74,7 @@ mod watcher {
         #[allow(dead_code)]
         #[derive(Debug)]
         pub enum InitialScanResult {
-            Active(ActiveRateLimitInfo),
-            Stale,
+            Found(RateLimitInfo),
             NoLimitFound,
         }
         pub fn scan_content_for_any_limit(_: &str) -> InitialScanResult {
@@ -180,6 +181,7 @@ async fn startup_scan(run: usize) -> Result<()> {
     let state = Arc::new(std::sync::Mutex::new(models::AppState {
         file_size_cache: HashMap::new(),
         lockout_target_time: None,
+        latest_rate_limit_event_time: None,
     }));
     production_startup::initial_scan(&state);
     let bytes: u64 = state

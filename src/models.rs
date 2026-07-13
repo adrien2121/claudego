@@ -7,6 +7,7 @@ pub type OutputActivity = Arc<AtomicU64>;
 
 pub struct AppState {
     pub lockout_target_time: Option<chrono::DateTime<chrono::Local>>,
+    pub latest_rate_limit_event_time: Option<chrono::DateTime<chrono::Local>>,
     /// Increments for live stream/file events; startup scan establishes baseline state.
     pub lockout_revision: u64,
     pub resume_exhausted_revision: Option<u64>,
@@ -18,6 +19,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             lockout_target_time: None,
+            latest_rate_limit_event_time: None,
             lockout_revision: 0,
             resume_exhausted_revision: None,
             file_size_cache: HashMap::new(),

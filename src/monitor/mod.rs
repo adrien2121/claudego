@@ -171,7 +171,7 @@ async fn recovery_control<T>(
 
 pub fn record_lockout(
     state: &SharedAppState,
-    limit_info: crate::watcher::scan::ActiveRateLimitInfo,
+    limit_info: crate::watcher::scan::RateLimitInfo,
     source: &str,
 ) {
     runtime::record_lockout(state, limit_info, source);

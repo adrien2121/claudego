@@ -2,12 +2,46 @@ use crate::logging::log_to_file;
 use crate::models::SharedAppState;
 use crate::monitor::helpers::SCAN_CHUNK_SIZE;
 use crate::watcher::files as watcher_files;
-use crate::watcher::scan::{ActiveRateLimitInfo, InitialScanResult};
+use crate::watcher::scan::{InitialScanResult, RateLimitInfo};
+use chrono::Local;
 use memchr;
 use std::fs::File;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::time::SystemTime;
+
+fn select_newest(
+    current: Option<RateLimitInfo>,
+    candidate: RateLimitInfo,
+) -> Option<RateLimitInfo> {
+    match current {
+        Some(current) if current.event_time >= candidate.event_time => Some(current),
+        _ => Some(candidate),
+    }
+}
+
+fn apply_startup_limit(state: &SharedAppState, limit: RateLimitInfo) {
+    let active = limit.target_time > Local::now();
+    if active {
+        log_to_file("  [MATCH] Active 'rate_limit' row found on startup scan.");
+        log_to_file(&format!(
+            "  [Extracted Text] Raw Limit Message: \"{}\"",
+            limit.raw_message
+        ));
+        log_to_file(&format!(
+            "  [SUCCESS] Valid active limit confirmed! Resets: {}",
+            limit.display_str
+        ));
+        log_to_file(&format!(
+            "[LOCKOUT ON STARTUP] Rate limit found. Target: {}",
+            limit.display_str
+        ));
+    }
+
+    let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
+    app.latest_rate_limit_event_time = Some(limit.event_time);
+    app.lockout_target_time = active.then_some(limit.target_time);
+}
 
 /// Scans a single file by reading it backwards in chunks. This is memory-efficient
 /// and robustly finds the most recent rate-limit message by correctly handling
@@ -71,8 +105,7 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
         // We must use `scan_content_for_any_limit` to correctly stop at the
         // first (most recent) limit, even if it's stale.
         match crate::watcher::scan::scan_content_for_any_limit(content_to_scan) {
-            InitialScanResult::Active(limit) => return Ok(InitialScanResult::Active(limit)),
-            InitialScanResult::Stale => return Ok(InitialScanResult::Stale),
+            InitialScanResult::Found(limit) => return Ok(InitialScanResult::Found(limit)),
             InitialScanResult::NoLimitFound => { /* Continue to the previous chunk */ }
         }
 
@@ -88,7 +121,7 @@ pub(super) fn initial_scan(state: &SharedAppState) {
     let initial_files = watcher_files::claude_projects_root()
         .map(|root| watcher_files::recent_session_logs(&root, SystemTime::UNIX_EPOCH))
         .unwrap_or_default();
-    let mut latest_limit: Option<ActiveRateLimitInfo> = None;
+    let mut latest_limit: Option<RateLimitInfo> = None;
 
     if !initial_files.is_empty() {
         log_to_file(&format!(
@@ -107,16 +140,8 @@ pub(super) fn initial_scan(state: &SharedAppState) {
             .insert(path.clone(), file_size);
 
         match scan_file_backwards(&path) {
-            Ok(InitialScanResult::Active(limit)) => {
-                if latest_limit
-                    .as_ref()
-                    .is_none_or(|l| limit.target_time > l.target_time)
-                {
-                    latest_limit = Some(limit);
-                }
-            }
-            Ok(InitialScanResult::Stale) => {
-                // Found a stale limit, which is the most recent one. We can ignore this file.
+            Ok(InitialScanResult::Found(limit)) => {
+                latest_limit = select_newest(latest_limit, limit);
             }
             Ok(InitialScanResult::NoLimitFound) => {
                 // No limit found in the entire file.
@@ -134,20 +159,82 @@ pub(super) fn initial_scan(state: &SharedAppState) {
     // Add a blank line for readability after the initial scan section.
     log_to_file("");
     if let Some(limit) = latest_limit {
-        log_to_file("  [MATCH] Active 'rate_limit' row found on startup scan.");
-        log_to_file(&format!(
-            "  [Extracted Text] Raw Limit Message: \"{}\"",
-            limit.raw_message
-        ));
-        log_to_file(&format!(
-            "  [SUCCESS] Valid active limit confirmed! Resets: {}",
-            limit.display_str
-        ));
-        log_to_file(&format!(
-            "[LOCKOUT ON STARTUP] Rate limit found. Target: {}",
-            limit.display_str
-        ));
-        let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
-        app.lockout_target_time = Some(limit.target_time);
+        apply_startup_limit(state, limit);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[allow(unused_imports)]
+    use super::{apply_startup_limit, select_newest};
+    #[allow(unused_imports)]
+    use crate::models::AppState;
+    use crate::watcher::scan::RateLimitInfo;
+    #[allow(unused_imports)]
+    use chrono::{Datelike, Local, TimeZone, Timelike};
+    #[allow(unused_imports)]
+    use std::sync::{Arc, Mutex};
+
+    #[allow(dead_code)]
+    fn limit(event_hour: u32, target_day: u32, target_hour: u32) -> RateLimitInfo {
+        RateLimitInfo {
+            event_time: Local
+                .with_ymd_and_hms(2026, 7, 12, event_hour, 0, 0)
+                .unwrap(),
+            target_time: Local
+                .with_ymd_and_hms(2026, 7, target_day, target_hour, 0, 5)
+                .unwrap(),
+            display_str: "fixture".to_string(),
+            raw_message: "fixture".to_string(),
+        }
+    }
+
+    #[test]
+    fn newer_session_event_beats_older_weekly_event_with_later_reset() {
+        let older_weekly = limit(20, 14, 10);
+        let newer_session = limit(23, 13, 0);
+        let selected = select_newest(select_newest(None, older_weekly), newer_session).unwrap();
+        assert_eq!(selected.event_time.hour(), 23);
+        assert_eq!(selected.target_time.day(), 13);
+    }
+
+    #[test]
+    fn newer_expired_event_suppresses_older_active_event() {
+        let older_active = limit(20, 14, 10);
+        let mut newer_expired = limit(23, 13, 0);
+        newer_expired.target_time = Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 5).unwrap();
+        let selected = select_newest(select_newest(None, older_active), newer_expired).unwrap();
+        assert_eq!(selected.event_time.hour(), 23);
+        assert_eq!(selected.target_time.day(), 12);
+    }
+
+    #[test]
+    fn newer_overnight_session_event_beats_older_weekly_event() {
+        let older_weekly = limit(20, 14, 10);
+        let newer_overnight = limit(23, 13, 2);
+        let selected = select_newest(select_newest(None, older_weekly), newer_overnight).unwrap();
+        assert_eq!(
+            selected.target_time,
+            Local.with_ymd_and_hms(2026, 7, 13, 2, 0, 5).unwrap()
+        );
+    }
+
+    #[test]
+    fn expired_newest_startup_event_sets_watermark_without_lockout() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let event_time = Local::now() - chrono::Duration::hours(2);
+        apply_startup_limit(
+            &state,
+            RateLimitInfo {
+                event_time,
+                target_time: Local::now() - chrono::Duration::hours(1),
+                display_str: "expired".to_string(),
+                raw_message: "expired".to_string(),
+            },
+        );
+        let app = state.lock().unwrap();
+        assert_eq!(app.latest_rate_limit_event_time, Some(event_time));
+        assert_eq!(app.lockout_target_time, None);
+        assert_eq!(app.lockout_revision, 0);
     }
 }

@@ -2,7 +2,7 @@ use crate::cli::{stream_json_resume_command, CommandSpec};
 use crate::logging::log_to_file;
 use crate::models::{mark_output_activity, OutputActivity, SharedAppState};
 use crate::resume::StreamResumeCommand;
-use crate::watcher::scan::{active_rate_limit_from_message, ActiveRateLimitInfo};
+use crate::watcher::scan::{rate_limit_from_message, RateLimitInfo};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde_json::Value;
@@ -17,7 +17,7 @@ const MAX_PARSER_LINE_BYTES: usize = 1024 * 1024;
 #[derive(Debug)]
 pub struct StreamJsonSignal {
     pub session_id: Option<String>,
-    pub rate_limit: Option<ActiveRateLimitInfo>,
+    pub rate_limit: Option<RateLimitInfo>,
 }
 
 #[derive(Debug)]
@@ -327,7 +327,7 @@ pub fn parse_stream_line(line: &str) -> StreamLineResult {
     }
 }
 
-fn extract_rate_limit(value: &Value) -> Option<ActiveRateLimitInfo> {
+fn extract_rate_limit(value: &Value) -> Option<RateLimitInfo> {
     if value.get("error").and_then(Value::as_str) != Some("rate_limit") {
         return None;
     }
@@ -338,7 +338,7 @@ fn extract_rate_limit(value: &Value) -> Option<ActiveRateLimitInfo> {
         .with_timezone(&Local);
     let message = find_rate_limit_text(value)?;
 
-    active_rate_limit_from_message(log_time, &message)
+    rate_limit_from_message(log_time, &message)
 }
 
 fn find_rate_limit_text(value: &Value) -> Option<String> {
@@ -387,8 +387,8 @@ mod tests {
     };
     use crate::cli::CommandSpec;
     use crate::models::{output_is_hot, AppState};
-    use crate::watcher::scan::ActiveRateLimitInfo;
-    use chrono::{Duration as ChronoDuration, Local};
+    use crate::watcher::scan::RateLimitInfo;
+    use chrono::{DateTime, Duration as ChronoDuration, Local};
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -470,6 +470,12 @@ mod tests {
             panic!("expected signal");
         };
         let limit = signal.rate_limit.expect("rate limit");
+        assert_eq!(
+            limit.event_time,
+            DateTime::parse_from_rfc3339("2099-07-09T10:00:00-04:00")
+                .unwrap()
+                .with_timezone(&Local)
+        );
         assert_eq!(limit.display_str, "5:30pm");
         assert_eq!(limit.raw_message, "Claude limit reached; resets 5:30pm");
     }
@@ -502,7 +508,8 @@ mod tests {
 
         crate::monitor::record_lockout(
             &state,
-            ActiveRateLimitInfo {
+            RateLimitInfo {
+                event_time: Local::now(),
                 target_time: Local::now() + ChronoDuration::hours(2),
                 display_str: "later".to_string(),
                 raw_message: "rate limit".to_string(),

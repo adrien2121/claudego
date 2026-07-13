@@ -30,7 +30,7 @@ trait ResumeAttempt {
 
 struct StableScan {
     new_size: u64,
-    limit: Option<crate::watcher::scan::ActiveRateLimitInfo>,
+    limit: Option<crate::watcher::scan::RateLimitInfo>,
     preview: Option<String>,
 }
 
@@ -59,13 +59,7 @@ fn scan_mmap_range(
     file: &File,
     old_size: u64,
     new_size: u64,
-) -> Result<
-    (
-        Option<crate::watcher::scan::ActiveRateLimitInfo>,
-        Option<String>,
-    ),
-    ScanFailure,
-> {
+) -> Result<(Option<crate::watcher::scan::RateLimitInfo>, Option<String>), ScanFailure> {
     // Safety: the file is opened read-only and the captured range is bounds-checked
     // before slicing, so concurrent truncation is reported instead of panicking.
     let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(ScanFailure::Mmap)?;
@@ -234,7 +228,7 @@ pub(super) async fn scan_and_update_state(
 
 pub(super) fn record_lockout(
     state: &SharedAppState,
-    limit_info: crate::watcher::scan::ActiveRateLimitInfo,
+    limit_info: crate::watcher::scan::RateLimitInfo,
     source: &str,
 ) {
     log_to_file(&format!(
@@ -243,11 +237,12 @@ pub(super) fn record_lockout(
     ));
     let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
     if app
-        .lockout_target_time
-        .is_some_and(|current| current >= limit_info.target_time)
+        .latest_rate_limit_event_time
+        .is_some_and(|watermark| limit_info.event_time <= watermark)
     {
         return;
     }
+    app.latest_rate_limit_event_time = Some(limit_info.event_time);
     app.lockout_revision = app.lockout_revision.wrapping_add(1);
     app.lockout_target_time = Some(limit_info.target_time);
 }
@@ -311,7 +306,7 @@ mod tests {
     };
     use crate::models::AppState;
     use crate::resume::ResumeOutcome;
-    use crate::watcher::scan::ActiveRateLimitInfo;
+    use crate::watcher::scan::RateLimitInfo;
     use chrono::{Duration, Local};
     use std::collections::HashSet;
     use std::fs::OpenOptions;
@@ -460,6 +455,15 @@ mod tests {
         Arc::new(Mutex::new(app))
     }
 
+    fn limit(event: chrono::DateTime<Local>, target: chrono::DateTime<Local>) -> RateLimitInfo {
+        RateLimitInfo {
+            event_time: event,
+            target_time: target,
+            display_str: target.to_rfc3339(),
+            raw_message: "fixture".to_string(),
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn three_retries_retain_lockout_and_mark_revision_exhausted() {
         let target = Local::now();
@@ -496,6 +500,21 @@ mod tests {
         assert_eq!(app.lockout_target_time, None);
         assert!(app.file_size_cache.is_empty());
         assert_eq!(app.resume_exhausted_revision, None);
+    }
+
+    #[tokio::test]
+    async fn already_due_new_runtime_event_reaches_expiry_and_attempts_resume() {
+        let now = Local::now();
+        let due = now - Duration::seconds(1);
+        let state = Arc::new(Mutex::new(AppState::new()));
+        record_lockout(&state, limit(now, due), "test");
+        let resume = ScriptedResume::outcomes(vec![ResumeOutcome::Sent]);
+
+        assert!(state.lock().unwrap().lockout_target_time.unwrap() <= Local::now());
+        handle_expiry_with(&state, due, resume.clone()).await;
+
+        assert_eq!(resume.attempts(), 1);
+        assert_eq!(state.lock().unwrap().lockout_target_time, None);
     }
 
     #[tokio::test]
@@ -614,7 +633,8 @@ mod tests {
 
         record_lockout(
             &state,
-            ActiveRateLimitInfo {
+            RateLimitInfo {
+                event_time: target,
                 target_time: target,
                 display_str: "5:30pm".to_string(),
                 raw_message: "Claude limit reached; resets 5:30pm".to_string(),
@@ -626,67 +646,44 @@ mod tests {
     }
 
     #[test]
-    fn rediscovered_lockout_does_not_create_a_new_revision_or_bypass_exhaustion() {
-        let target = Local::now() + Duration::minutes(30);
-        let state = shared_state_with_lockout(target, 7);
-        state.lock().unwrap().resume_exhausted_revision = Some(7);
-
+    fn newer_event_replaces_target_even_when_target_is_earlier() {
+        let now = Local::now();
+        let state = shared_state_with_lockout(now + Duration::hours(4), 9);
+        state.lock().unwrap().latest_rate_limit_event_time = Some(now);
         record_lockout(
             &state,
-            ActiveRateLimitInfo {
-                target_time: target,
-                display_str: "5:30pm".to_string(),
-                raw_message: "same target in an unrelated appended event".to_string(),
-            },
-            "file watcher",
+            limit(now + Duration::minutes(1), now + Duration::hours(1)),
+            "test",
         );
-
         let app = state.lock().unwrap();
+        assert_eq!(app.lockout_target_time, Some(now + Duration::hours(1)));
+        assert_eq!(
+            app.latest_rate_limit_event_time,
+            Some(now + Duration::minutes(1))
+        );
+        assert_eq!(app.lockout_revision, 10);
+    }
+
+    #[test]
+    fn older_and_equal_events_preserve_target_revision_and_exhaustion() {
+        let now = Local::now();
+        let original_target = now + Duration::hours(2);
+        let state = shared_state_with_lockout(original_target, 7);
+        {
+            let mut app = state.lock().unwrap();
+            app.latest_rate_limit_event_time = Some(now);
+            app.resume_exhausted_revision = Some(7);
+        }
+        record_lockout(
+            &state,
+            limit(now - Duration::seconds(1), now + Duration::hours(3)),
+            "older",
+        );
+        record_lockout(&state, limit(now, now + Duration::hours(4)), "equal");
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_target_time, Some(original_target));
         assert_eq!(app.lockout_revision, 7);
         assert_eq!(app.resume_exhausted_revision, Some(7));
-        assert_eq!(app.lockout_target_time, Some(target));
-    }
-
-    #[test]
-    fn older_rediscovery_does_not_replace_a_materially_newer_target() {
-        let newer = Local::now() + Duration::hours(2);
-        let older = newer - Duration::hours(1);
-        let state = shared_state_with_lockout(newer, 9);
-
-        record_lockout(
-            &state,
-            ActiveRateLimitInfo {
-                target_time: older,
-                display_str: "older".to_string(),
-                raw_message: "older rediscovery".to_string(),
-            },
-            "file watcher",
-        );
-
-        let app = state.lock().unwrap();
-        assert_eq!(app.lockout_revision, 9);
-        assert_eq!(app.lockout_target_time, Some(newer));
-    }
-
-    #[test]
-    fn newer_lockout_creates_a_new_revision() {
-        let older = Local::now() + Duration::minutes(30);
-        let newer = older + Duration::hours(1);
-        let state = shared_state_with_lockout(older, 9);
-
-        record_lockout(
-            &state,
-            ActiveRateLimitInfo {
-                target_time: newer,
-                display_str: "newer".to_string(),
-                raw_message: "newer target".to_string(),
-            },
-            "file watcher",
-        );
-
-        let app = state.lock().unwrap();
-        assert_eq!(app.lockout_revision, 10);
-        assert_eq!(app.lockout_target_time, Some(newer));
     }
 
     #[test]
