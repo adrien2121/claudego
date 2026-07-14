@@ -25,7 +25,7 @@ fn final_pty_bytes_drain_before_shutdown() {
     let tmp = std::env::temp_dir().join(format!("claudego-pty-exit-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create isolated temp directory");
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_claudego"));
-    command.args(["--", "/bin/sh", "-c", "printf 'FINAL-PTY-BYTES\\n'"]);
+    command.args(["--", "/bin/sh", "-c", "printf 'FINAL-PTY-BYTES\\n'; exit 7"]);
     command.env("TMPDIR", &tmp);
     let mut child = pair.slave.spawn_command(command).expect("spawn claudego");
     drop(pair.slave);
@@ -33,7 +33,7 @@ fn final_pty_bytes_drain_before_shutdown() {
 
     loop {
         if let Some(status) = child.try_wait().expect("poll claudego") {
-            assert!(status.success());
+            assert_eq!(status.exit_code(), 7);
             let output = output_rx
                 .recv_timeout(Duration::from_secs(1))
                 .expect("capture wrapper output");
@@ -44,6 +44,7 @@ fn final_pty_bytes_drain_before_shutdown() {
                 .find("[System] Child process exited. Shutting down.")
                 .unwrap();
             assert!(reader_stop < shutdown);
+            assert!(!tmp.join("claudego.port").exists());
             let _ = std::fs::remove_dir_all(&tmp);
             return;
         }

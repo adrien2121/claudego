@@ -1,6 +1,6 @@
 use crate::cli::{select_runner, CommandSpec, RunnerKind};
 use crate::logging;
-use crate::models::AppState;
+use crate::models::{AppState, ChildOutcome};
 use crate::monitor;
 use crate::pty_bridge;
 use crate::resume::ResumeTarget;
@@ -29,7 +29,33 @@ async fn drain_reader(handle: tokio::task::JoinHandle<()>, timeout: Duration) ->
     }
 }
 
-pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
+async fn run_pty_interactive(
+    command_spec: CommandSpec,
+    state: Arc<Mutex<AppState>>,
+) -> Result<ChildOutcome> {
+    let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
+    let _guard = RawModeGuard::init()?;
+
+    let reader_handle = pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
+    pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
+    pty_bridge::spawn_resize_poller(session.master, session.initial_size);
+    monitor::spawn_lockout_monitor(state, ResumeTarget::Pty(Arc::clone(&session.writer)));
+
+    let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
+    let status = child_wait_handle.await??;
+    match drain_reader(reader_handle, PTY_DRAIN_TIMEOUT).await {
+        ReaderDrain::Completed => {}
+        ReaderDrain::JoinFailed(error) => {
+            logging::log_to_file(&format!("[PTY Output Error] reader task failed: {error}"))
+        }
+        ReaderDrain::TimedOut => logging::log_to_file(&format!(
+            "[PTY Output Error] reader drain timed out after {PTY_DRAIN_TIMEOUT:?}"
+        )),
+    }
+    Ok(ChildOutcome::from_pty(status))
+}
+
+pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutcome> {
     // Unconditionally start logging
     // 1. Clear the old log file before the logger thread starts.
     logging::reset_log_file();
@@ -55,40 +81,20 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<()> {
         }
     }
 
-    match select_runner(&command_spec) {
-        RunnerKind::PtyInteractive => {
-            let mut session = pty_bridge::spawn_command_in_pty(command_spec)?;
-            let _guard = RawModeGuard::init()?;
-
-            let reader_handle = pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
-            pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
-            pty_bridge::spawn_resize_poller(session.master, session.initial_size);
-            monitor::spawn_lockout_monitor(state, ResumeTarget::Pty(Arc::clone(&session.writer)));
-
-            let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
-            let _ = child_wait_handle.await??;
-            match drain_reader(reader_handle, PTY_DRAIN_TIMEOUT).await {
-                ReaderDrain::Completed => {}
-                ReaderDrain::JoinFailed(error) => {
-                    logging::log_to_file(&format!("[PTY Output Error] reader task failed: {error}"))
-                }
-                ReaderDrain::TimedOut => logging::log_to_file(&format!(
-                    "[PTY Output Error] reader drain timed out after {PTY_DRAIN_TIMEOUT:?}"
-                )),
-            }
-        }
+    let outcome = match select_runner(&command_spec) {
+        RunnerKind::PtyInteractive => run_pty_interactive(command_spec, state).await,
         RunnerKind::StreamJsonPrint => {
             let (resume_tx, resume_rx) = mpsc::unbounded_channel::<StreamResumeCommand>();
             monitor::spawn_lockout_monitor(state.clone(), ResumeTarget::StreamJson(resume_tx));
-            stream_json::run_stream_json_print(command_spec, state, resume_rx).await?;
+            stream_json::run_stream_json_print(command_spec, state, resume_rx).await
         }
-    }
+    };
 
     logging::log_to_file("[System] Child process exited. Shutting down.");
     // Gracefully shut down the logger, ensuring all messages are flushed.
     logging::shutdown_logging(logger_handle).await;
 
-    Ok(())
+    outcome
 }
 
 fn open_logs_terminal() {

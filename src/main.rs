@@ -26,7 +26,7 @@ struct Cli {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<std::process::ExitCode> {
     let cli = Cli::parse();
 
     let _awake_guard = if cli.prevent_sleep {
@@ -50,5 +50,7 @@ async fn main() -> Result<()> {
         CommandSpec { program, args }
     };
 
-    app::run(cli.show_logs, command_spec).await
+    let outcome = app::run(cli.show_logs, command_spec).await?;
+    drop(_awake_guard);
+    Ok(std::process::ExitCode::from(outcome.wrapper_code()))
 }
