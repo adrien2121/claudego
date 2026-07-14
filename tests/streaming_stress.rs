@@ -283,6 +283,7 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
         String::from_utf8_lossy(&stderr),
         String::from_utf8_lossy(&log)
     );
+    assert!(String::from_utf8_lossy(&log).contains("Raw Limit Message"));
     assert!(
         stderr
             .windows(b"READY\n".len())

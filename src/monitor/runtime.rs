@@ -1,4 +1,4 @@
-use crate::logging::{log_to_file, log_with_content};
+use crate::logging::log_to_file;
 use crate::models::{output_is_hot, SharedAppState};
 use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
 use crate::resume::{ResumeOutcome, ResumeTarget};
@@ -9,10 +9,6 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-
-/// To prevent unbounded memory usage when a log file has a very large amount of new
-/// content, we cap the content collected for logging to 1 MiB.
-const MAX_PREVIEW_CONTENT_SIZE: usize = 1_048_576;
 
 /// When scanning a modified file, re-scan this many bytes from the end of the
 /// previously seen content to be robust against missed initial detections.
@@ -31,7 +27,6 @@ trait ResumeAttempt {
 struct StableScan {
     new_size: u64,
     limit: Option<crate::watcher::scan::RateLimitInfo>,
-    preview: Option<String>,
 }
 
 #[derive(Debug)]
@@ -59,7 +54,7 @@ fn scan_mmap_range(
     file: &File,
     old_size: u64,
     new_size: u64,
-) -> Result<(Option<crate::watcher::scan::RateLimitInfo>, Option<String>), ScanFailure> {
+) -> Result<Option<crate::watcher::scan::RateLimitInfo>, ScanFailure> {
     // Safety: the file is opened read-only and the captured range is bounds-checked
     // before slicing, so concurrent truncation is reported instead of panicking.
     let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(ScanFailure::Mmap)?;
@@ -73,22 +68,7 @@ fn scan_mmap_range(
     }
     let scan_slice = &mmap[scan_start..new_size];
     let scan_str = std::str::from_utf8(scan_slice).map_err(|_| ScanFailure::InvalidUtf8)?;
-    let mut new_content_offset = (old_size as usize).saturating_sub(scan_start);
-    while new_content_offset < scan_str.len() && !scan_str.is_char_boundary(new_content_offset) {
-        new_content_offset += 1;
-    }
-    let preview = (new_content_offset < scan_str.len()).then(|| {
-        let content = &scan_str[new_content_offset..];
-        let mut preview_len = content.len().min(MAX_PREVIEW_CONTENT_SIZE);
-        while !content.is_char_boundary(preview_len) {
-            preview_len -= 1;
-        }
-        crate::monitor::formatters::create_content_preview(&content[..preview_len])
-    });
-    Ok((
-        crate::watcher::scan::scan_content_for_limit(scan_str),
-        preview,
-    ))
+    Ok(crate::watcher::scan::scan_content_for_limit(scan_str))
 }
 
 fn scan_stable_range_with(
@@ -100,21 +80,17 @@ fn scan_stable_range_with(
     let before = file.metadata().map_err(ScanFailure::Metadata)?;
     let new_size = before.len();
     let modified = before.modified().map_err(ScanFailure::Metadata)?;
-    let (limit, preview) = if new_size > old_size {
+    let limit = if new_size > old_size {
         scan_mmap_range(&file, old_size, new_size)?
     } else {
-        (None, None)
+        None
     };
     after_scan();
     let after = file.metadata().map_err(ScanFailure::Metadata)?;
     if after.len() != new_size || after.modified().map_err(ScanFailure::Metadata)? != modified {
         return Err(ScanFailure::Changed);
     }
-    Ok(StableScan {
-        new_size,
-        limit,
-        preview,
-    })
+    Ok(StableScan { new_size, limit })
 }
 
 fn scan_stable_range(path: &Path, old_size: u64) -> Result<StableScan, ScanFailure> {
@@ -184,7 +160,7 @@ pub(super) async fn scan_and_update_state(
     ));
 
     for path in paths {
-        let StableScan { limit, preview, .. } = match scan_one_path(&path, state) {
+        let StableScan { limit, .. } = match scan_one_path(&path, state) {
             Ok(scan) => {
                 failure_logs.remove(&path);
                 scan
@@ -201,13 +177,6 @@ pub(super) async fn scan_and_update_state(
                 continue;
             }
         };
-        if let Some(content_preview) = preview {
-            log_with_content(
-                &format!("[File Content] New data in {}:", path.display()),
-                content_preview,
-            );
-        }
-
         if let Some(limit_info) = limit {
             // These logs were previously inside `watcher::scan::parse_rate_limit_line`.
             // Moving them here makes the parser a pure function.
@@ -695,32 +664,6 @@ mod tests {
         let file = std::fs::File::open(&path).unwrap();
 
         let result = scan_mmap_range_for_test(&file, 4097, content.len() as u64);
-
-        assert!(result.is_ok());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn preview_byte_cap_aligns_to_utf8_character_boundaries() {
-        let path = unique_path("utf8-preview.jsonl");
-        let content = format!("{}é", "a".repeat(super::MAX_PREVIEW_CONTENT_SIZE - 1));
-        std::fs::write(&path, content.as_bytes()).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-
-        let result = scan_mmap_range_for_test(&file, 0, content.len() as u64);
-
-        assert!(result.is_ok());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn preview_offset_advances_when_cached_size_splits_a_character() {
-        let path = unique_path("utf8-preview-offset.jsonl");
-        let content = "é{\"type\":\"event\"}\n";
-        std::fs::write(&path, content.as_bytes()).unwrap();
-        let file = std::fs::File::open(&path).unwrap();
-
-        let result = scan_mmap_range_for_test(&file, 1, content.len() as u64);
 
         assert!(result.is_ok());
         std::fs::remove_file(path).unwrap();

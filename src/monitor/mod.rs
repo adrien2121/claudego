@@ -9,8 +9,6 @@ use tokio::time::{sleep, Duration};
 
 /// Handles debouncing and collecting file system events.
 mod events;
-/// Contains helper functions for formatting log output.
-mod formatters;
 /// Contains helper functions for logging intervals and other utilities.
 mod helpers;
 /// Manages the lifecycle of the file system watcher (creation, recovery).

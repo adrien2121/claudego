@@ -268,18 +268,6 @@ pub fn log_to_file(msg: &str) {
     }
 }
 
-/// Logs a prefix message followed by pre-formatted, multi-line content.
-pub fn log_with_content(prefix: &str, content: String) {
-    if let Some(sender) = LOGGER_SENDER.get() {
-        let prefix_line = format!("[{}] {}", Local::now().format("%H:%M:%S"), prefix);
-        // The content is expected to not have a trailing newline, so we add one if needed.
-        let full_log = format!("{}\n{}", prefix_line, content.trim_end());
-
-        // Send the combined string as a single message to ensure it's written atomically.
-        try_queue_line(sender, &DROPPED_LOG_MESSAGES, full_log);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{push_startup_line, run_logger, try_queue_line, write_with_timeout, LogMessage};
