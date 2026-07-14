@@ -10,8 +10,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc::{self, Sender};
 use tokio::time::timeout;
 
-use crate::paths;
-
 /// A message sent to the dedicated logger thread.
 enum LogMessage {
     /// A single line of text to be written to the log.
@@ -200,9 +198,10 @@ async fn run_logger(
 ///
 /// This function should be called once at application startup. It returns the handle
 /// to the logger thread, which should be used for a graceful shutdown.
-pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
-    // Clean up the port file from any previous unclean shutdown.
-    let _ = fs::remove_file(paths::port_path());
+pub fn init_logging(
+    paths: crate::paths::LoggerPaths,
+) -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
+    let _ = fs::remove_file(&paths.port);
 
     let (log_tx, log_rx) = mpsc::channel::<LogMessage>(100); // Use a buffered channel
                                                              // This will succeed as we call init_logging() only once.
@@ -212,8 +211,6 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
 
     let handle = tokio::spawn(async move {
-        let path = paths::log_path();
-
         // --- 1. Set up network listener for live logs ---
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(l) => l,
@@ -223,21 +220,20 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
             }
         };
         if let Ok(addr) = listener.local_addr() {
-            if fs::write(paths::port_path(), addr.port().to_string()).is_ok() {
+            if fs::write(&paths.port, addr.port().to_string()).is_ok() {
                 // Successfully wrote the port file. Signal that we are ready.
                 let _ = ready_tx.send(()); // Use blocking send for initial setup
             }
         }
         run_logger(
             listener,
-            path,
+            paths.log.clone(),
             log_rx,
             MAX_STARTUP_BUFFER_LINES,
             CLIENT_WRITE_TIMEOUT,
         )
         .await;
         // Clean up the port file on graceful shutdown.
-        let _ = fs::remove_file(paths::port_path());
     });
 
     (handle, ready_rx)
@@ -245,7 +241,10 @@ pub fn init_logging() -> (tokio::task::JoinHandle<()>, StdReceiver<()>) {
 
 /// Signals the logger thread to shut down and waits for it to finish.
 /// This ensures all pending log messages are flushed to the file.
-pub async fn shutdown_logging(handle: tokio::task::JoinHandle<()>) {
+pub async fn shutdown_logging(
+    handle: tokio::task::JoinHandle<()>,
+    paths: &crate::paths::LoggerPaths,
+) {
     if let Some(sender) = LOGGER_SENDER.get() {
         // The receiver might already be gone if the thread panicked, so ignore errors.
         let dropped = DROPPED_LOG_MESSAGES.swap(0, Ordering::AcqRel);
@@ -255,10 +254,11 @@ pub async fn shutdown_logging(handle: tokio::task::JoinHandle<()>) {
     }
     // Wait for the logger thread to process all messages and exit.
     let _ = handle.await;
+    let _ = fs::remove_file(&paths.port);
 }
 
-pub fn reset_log_file() {
-    let _ = std::fs::remove_file(paths::log_path());
+pub fn reset_log_file(paths: &crate::paths::LoggerPaths) {
+    let _ = std::fs::remove_file(&paths.log);
 }
 
 pub fn log_to_file(msg: &str) {

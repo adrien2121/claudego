@@ -94,10 +94,10 @@ struct LoggerPaths {
     port: PathBuf,
 }
 
-fn logger_paths(run_dir: &Path) -> LoggerPaths {
+fn logger_paths(run_dir: &Path, pid: u32) -> LoggerPaths {
     let tmp_dir = run_dir.join("tmp");
-    let log = tmp_dir.join("claudego.log");
-    let port = tmp_dir.join("claudego.port");
+    let log = tmp_dir.join(format!("claudego-{pid}.log"));
+    let port = tmp_dir.join(format!("claudego-{pid}.port"));
     LoggerPaths { tmp_dir, log, port }
 }
 
@@ -183,8 +183,8 @@ fn helper_self_check() -> BenchResult<()> {
         return Err(failure("p99 self-check failed"));
     }
 
-    let first = logger_paths(Path::new("first-run"));
-    let second = logger_paths(Path::new("second-run"));
+    let first = logger_paths(Path::new("first-run"), 41);
+    let second = logger_paths(Path::new("second-run"), 42);
     for paths in [&first, &second] {
         if paths.log.parent() != Some(paths.tmp_dir.as_path())
             || paths.port.parent() != Some(paths.tmp_dir.as_path())
@@ -194,17 +194,6 @@ fn helper_self_check() -> BenchResult<()> {
     }
     if first.log == second.log || first.port == second.port {
         return Err(failure("different runs share logger paths"));
-    }
-    let global_log = global_log_path();
-    let global_port = global_port_path();
-    if first.log == global_log
-        || second.log == global_log
-        || first.port == global_port
-        || second.port == global_port
-    {
-        return Err(failure(
-            "run-local logger paths equal global preflight paths",
-        ));
     }
     Ok(())
 }
@@ -255,12 +244,12 @@ fn run_scenario(
 ) -> BenchResult<RunMetrics> {
     let count_path = run_dir.join("expected-count");
     let gate_path = run_dir.join("flood-gate");
-    let logger_paths = logger_paths(run_dir);
+    let tmp_dir = run_dir.join("tmp");
     let session_path = if scenario.uses_monitor() {
-        fs::create_dir(&logger_paths.tmp_dir).map_err(|error| {
+        fs::create_dir(&tmp_dir).map_err(|error| {
             failure(format!(
                 "create run-local logger directory {}: {error}",
-                logger_paths.tmp_dir.display()
+                tmp_dir.display()
             ))
         })?;
         Some(prepare_monitor_home(run_dir)?)
@@ -294,7 +283,7 @@ fn run_scenario(
         ]);
         let home = run_dir.join("home");
         command.env("HOME", &home);
-        command.env("TMPDIR", &logger_paths.tmp_dir);
+        command.env("TMPDIR", &tmp_dir);
         command
     };
 
@@ -309,6 +298,10 @@ fn run_scenario(
     let reader = pair.master.try_clone_reader()?;
     let deadline = Instant::now() + RUN_TIMEOUT;
     let mut child = pair.slave.spawn_command(command)?;
+    let wrapper_pid = child
+        .process_id()
+        .ok_or_else(|| failure("scenario child PID unavailable"))?;
+    let logger_paths = logger_paths(run_dir, wrapper_pid);
     drop(pair.slave);
     let output_rx = spawn_output_reader(reader);
 
@@ -548,29 +541,30 @@ fn verify_expected_count(count_path: &Path, verified_bytes: u64) -> BenchResult<
 }
 
 fn ensure_no_active_claudego() -> BenchResult<()> {
-    let global_port = global_port_path();
-    if let Some(address) = logger_address(&global_port) {
-        if TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok() {
-            return Err(failure(
-                "another claudego logger is active; stop it before benchmarking",
-            ));
+    let entries = fs::read_dir(std::env::temp_dir())?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(pid) = name
+            .strip_prefix("claudego-")
+            .and_then(|name| name.strip_suffix(".port"))
+            .and_then(|pid| pid.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if logger_address(&path).is_some_and(|address| {
+            TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
+        }) {
+            return Err(failure(format!(
+                "claudego logger PID {pid} is active; stop it before benchmarking"
+            )));
         }
     }
-    reset_global_log_files();
+    let _ = fs::remove_file(std::env::temp_dir().join("claudego.log"));
+    let _ = fs::remove_file(std::env::temp_dir().join("claudego.port"));
     Ok(())
-}
-
-fn reset_global_log_files() {
-    let _ = fs::remove_file(global_log_path());
-    let _ = fs::remove_file(global_port_path());
-}
-
-fn global_log_path() -> PathBuf {
-    std::env::temp_dir().join("claudego.log")
-}
-
-fn global_port_path() -> PathBuf {
-    std::env::temp_dir().join("claudego.port")
 }
 
 fn logger_address(port_path: &Path) -> Option<SocketAddr> {

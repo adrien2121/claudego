@@ -40,10 +40,8 @@ claudego -p -- claude
 ```
 
 ### Viewing Logs (`claudego-logs`)
-If you run `claudego --show-logs`, a second terminal will open to display logs.
 
-The installation also includes a companion `claudego-logs` command. It can be used in a separate terminal while `claudego` is running.
-This will automatically find the correct log file for your system and tail it in real-time. Press `Ctrl+C` to exit.
+`claudego --show-logs` opens `claudego-logs <pid>` for that exact run. You can also run `claudego-logs <pid>` manually. Bare `claudego-logs` selects the newest reachable run and rescans after it disconnects; it never merges concurrent logs.
 
 ## Installation
 

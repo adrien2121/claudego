@@ -61,10 +61,18 @@ fn first_difference(actual: &[u8], expected: &[u8]) -> Option<usize> {
 fn wait_for_file(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.is_file() {
+        let entries = path
+            .parent()
+            .and_then(|parent| fs::read_dir(parent).ok())
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
+            "timed out waiting for {}; entries: {entries:?}",
+            path.display(),
         );
         thread::sleep(Duration::from_millis(10));
     }
@@ -130,9 +138,6 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
 
     let session = project.join("session.jsonl");
     fs::write(&session, b"{\"type\":\"baseline\"}\n").expect("seed session log");
-    let log_path = tmp.join("claudego.log");
-    let port_path = tmp.join("claudego.port");
-
     let child = Command::new(env!("CARGO_BIN_EXE_claudego"))
         .args([
             "--",
@@ -149,6 +154,9 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn real claudego binary");
+    let wrapper_pid = child.id();
+    let log_path = tmp.join(format!("claudego-{wrapper_pid}.log"));
+    let port_path = tmp.join(format!("claudego-{wrapper_pid}.port"));
     let mut child = ChildGuard(Some(child));
 
     let mut stdout = child.child_mut().stdout.take().expect("capture stdout");

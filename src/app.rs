@@ -58,10 +58,11 @@ async fn run_pty_interactive(
 pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutcome> {
     // Unconditionally start logging
     // 1. Clear the old log file before the logger thread starts.
-    logging::reset_log_file();
+    let logger_paths = crate::paths::current_logger_paths();
+    logging::reset_log_file(&logger_paths);
     // 2. Initialize the new asynchronous logger.
     // It now returns a handle and a receiver to signal when the TCP server is ready.
-    let (logger_handle, logger_ready_rx) = logging::init_logging();
+    let (logger_handle, logger_ready_rx) = logging::init_logging(logger_paths.clone());
     logging::log_to_file("System initialized. Logger active. Starting passive monitoring.");
     let state = Arc::new(Mutex::new(AppState::new()));
 
@@ -73,7 +74,7 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutc
             .recv_timeout(std::time::Duration::from_secs(5))
             .is_ok()
         {
-            open_logs_terminal();
+            open_logs_terminal(std::process::id());
         } else {
             println!(
                 "[System] Warning: Live log viewer failed to start (logger did not become ready)."
@@ -92,12 +93,12 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutc
 
     logging::log_to_file("[System] Child process exited. Shutting down.");
     // Gracefully shut down the logger, ensuring all messages are flushed.
-    logging::shutdown_logging(logger_handle).await;
+    logging::shutdown_logging(logger_handle, &logger_paths).await;
 
     outcome
 }
 
-fn open_logs_terminal() {
+fn open_logs_terminal(pid: u32) {
     println!("[System] Live log streaming enabled.");
     println!("[System] Launching claudego-logs in a new terminal...");
 
@@ -110,7 +111,10 @@ fn open_logs_terminal() {
 
     #[cfg(target_os = "macos")]
     {
-        let script = format!(r#"tell application "Terminal" to do script "{}""#, logs_bin);
+        let script = format!(
+            r#"tell application "Terminal" to do script "{} {}""#,
+            logs_bin, pid
+        );
         let _ = std::process::Command::new("osascript")
             .arg("-e")
             .arg(script)
@@ -120,7 +124,7 @@ fn open_logs_terminal() {
     {
         let _ = std::process::Command::new("cmd")
             .arg("/c")
-            .arg(format!("start \"Claudego Logs\" \"{}\"", logs_bin))
+            .arg(format!("start \"Claudego Logs\" \"{}\" {}", logs_bin, pid))
             .spawn();
     }
     #[cfg(target_os = "linux")]
@@ -128,6 +132,7 @@ fn open_logs_terminal() {
         let _ = std::process::Command::new("gnome-terminal")
             .arg("--")
             .arg(&logs_bin)
+            .arg(pid.to_string())
             .spawn();
     }
 }
