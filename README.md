@@ -1,76 +1,53 @@
 # claudego
 
-`claudego` automatically sends `continue` to your active Claude CLI session when your usage limit has been restored. If you are running a long session, you no longer need to manually jumpstart the conversation once your limit is reset.
+`claudego` wraps Claude Code and resumes rate-limited sessions when usage resets.
 
-## What it Does
+## Requirements
 
-`claudego` is a "fire-and-forget" wrapper for the `claude` CLI. It runs your command as usual, but works silently in the background to monitor for rate-limit errors across all of Claude's session files on your system.
+- [Claude Code](https://code.claude.com/docs/en/setup) installed, authenticated, and available as `claude`.
+- [Rust/Cargo](https://rustup.rs/).
 
-When it detects a rate limit (e.g., "Please try again in 5 hours."), it calculates the reset time and waits. Once the cooldown is over, it automatically injects a `continue` command into your session, resuming the work without your intervention.
+## Install
 
-The monitoring process is designed to be highly efficient and non-intrusive. For a detailed view of its operations, you can use the `--show-logs` flag.
+On macOS, Linux, or Windows, install `claudego` and `claudego-logs` to Cargo's binary directory:
 
-When you hit a rate limit, you will see a message like this in your terminal:
-
-```
-You've reached your usage limit. Please try again in 5 hours.
-[claudego] Rate limit detected. Resuming automatically in 4h 59m 55s...
+```sh
+cargo install --git https://github.com/adrien2121/claudego.git
 ```
 
 ## Usage
 
-**Basic Usage:**
+Run Claude:
 
-To start a simple, monitored `claude` session, just run the command by itself.
-```bash
+```sh
 claudego
 ```
 
-**Run `claude` with specific arguments:**
-```bash
-claudego -- claude --model opus "Summarize this document for me"
+Pass Claude arguments or run another command after `--`:
+
+```sh
+claudego -- claude --model opus
+claudego -- <command> [args...]
 ```
 
-**Preventing System Sleep:**
+Keep the system awake while running:
 
-For long-running sessions that might span several hours, it's crucial to prevent your computer from going to sleep. `claudego` has a built-in feature for this. Use the `-p` or `--prevent-sleep` flag to keep your system awake.
-
-```bash
-claudego -p -- claude
+```sh
+claudego --prevent-sleep
 ```
 
-### Viewing Logs (`claudego-logs`)
+Open live logs for the current run, or attach manually:
 
-`claudego --show-logs` opens `claudego-logs <pid>` for that exact run. You can also run `claudego-logs <pid>` manually. Bare `claudego-logs` selects the newest reachable run and rescans after it disconnects; it never merges concurrent logs.
-
-## Installation
-
----
-
-### macOS / Linux
-
-You can install `claudego` with the following command. The script will install the binary to `$HOME/.local/bin`.
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/adrien2121/claudego/main/install.sh | sh
+```sh
+claudego --show-logs
+claudego-logs [pid]
 ```
 
-Please ensure `$HOME/.local/bin` is in your `PATH` environment variable.
+Without a PID, `claudego-logs` follows the newest reachable run and waits for the next one after disconnection.
 
-### Windows
+## Behavior
 
-You can install `claudego` with this one-line command in PowerShell. This will download the latest release and place it in a local directory.
-
-```powershell
-iwr https://raw.githubusercontent.com/adrien2121/claudego/main/install.ps1 -useb | iex
-```
-
-## Technical Details
-
-`claudego` employs an efficient, two-phase process to monitor for rate-limit messages without impacting system performance.
-
-1.  **Initial Scan:** On startup, the tool performs a fast, memory-efficient scan of existing Claude session logs. It reads files *backwards* from the end in small chunks, stopping as soon as it finds the most recent rate-limit message.
-
-2.  **Runtime Monitoring:** After the initial scan, `claudego` uses an OS-native file system watcher to monitor for changes. When a log file is updated, it uses memory-mapping to read only the new data. This process is extremely fast and has a low overhead.
-
-To avoid performance issues, the monitor will temporarily pause its scanning activities if it detects that the `claude` CLI is actively streaming a response. This ensures that `claudego`'s background I/O does not interfere with the user's interactive session.
+- Watches local Claude session logs for usage-limit resets, waits, then sends `continue`.
+- Interactive commands run in a PTY. Claude with `-p`/`--print` and `--output-format stream-json` resumes by session ID.
+- Returns the child process exit code when the platform provides one.
+- `--prevent-sleep` depends on OS support. `--show-logs` requires a supported terminal launcher.
