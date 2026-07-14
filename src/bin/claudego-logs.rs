@@ -87,17 +87,17 @@ fn main() -> Result<()> {
     let pid = requested_pid()?;
     println!("Waiting for claudego session to start...");
     loop {
-        if try_connect_and_stream(pid).is_ok() {
-            println!("\nConnection to claudego process lost. Waiting for it to restart...");
-            continue;
-        }
-
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher: RecommendedWatcher =
             notify::recommended_watcher(tx).context("Failed to create filesystem watcher")?;
         watcher
             .watch(&std::env::temp_dir(), RecursiveMode::NonRecursive)
             .context("Failed to start watching temp directory")?;
+
+        if try_connect_and_stream(pid).is_ok() {
+            println!("\nConnection to claudego process lost. Waiting for it to restart...");
+            continue;
+        }
 
         for result in rx {
             if let Ok(event) = result {
