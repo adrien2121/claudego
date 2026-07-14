@@ -38,23 +38,34 @@ mod watcher {
         }
         pub fn recent_session_logs(root: &Path, after: SystemTime) -> Vec<(PathBuf, SystemTime)> {
             let mut files = Vec::new();
-            if let Ok(projects) = std::fs::read_dir(root) {
-                for project in projects.flatten().filter(|p| p.path().is_dir()) {
-                    if let Ok(entries) = std::fs::read_dir(project.path()) {
-                        for entry in entries.flatten() {
-                            if let Ok(meta) = entry.metadata() {
-                                if meta.is_file()
-                                    && entry.path().extension().and_then(|x| x.to_str())
-                                        == Some("jsonl")
-                                {
-                                    if let Ok(modified) = meta.modified() {
-                                        if modified > after {
-                                            files.push((entry.path(), modified));
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            let mut directories = vec![root.to_path_buf()];
+            while let Some(directory) = directories.pop() {
+                let Ok(entries) = std::fs::read_dir(directory) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    if file_type.is_dir() {
+                        directories.push(entry.path());
+                        continue;
+                    }
+                    if !file_type.is_file()
+                        || entry
+                            .path()
+                            .extension()
+                            .and_then(|extension| extension.to_str())
+                            != Some("jsonl")
+                    {
+                        continue;
+                    }
+                    let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified())
+                    else {
+                        continue;
+                    };
+                    if modified > after {
+                        files.push((entry.path(), modified));
                     }
                 }
             }

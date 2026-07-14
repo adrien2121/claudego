@@ -14,47 +14,118 @@ pub(crate) fn recent_session_logs(
     modified_after: SystemTime,
 ) -> Vec<(PathBuf, SystemTime)> {
     let mut files = Vec::new();
+    let mut directories = vec![projects_root.to_path_buf()];
 
-    if let Ok(project_entries) = fs::read_dir(projects_root) {
-        // Iterate through each project directory inside `.claude/projects`.
-        for project_entry in project_entries.flatten() {
-            if !project_entry.path().is_dir() {
+    while let Some(directory) = directories.pop() {
+        let Ok(entries) = fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                directories.push(entry.path());
                 continue;
             }
 
-            // Collect recent log files from the individual project directory.
-            collect_recent_jsonl_files(project_entry.path(), modified_after, &mut files);
+            if !file_type.is_file()
+                || entry
+                    .path()
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    != Some("jsonl")
+            {
+                continue;
+            }
+            let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
+                continue;
+            };
+            if modified > modified_after {
+                files.push((entry.path(), modified));
+            }
         }
     }
 
     files
 }
 
-/// Helper to collect recent `.jsonl` files from a single project directory.
-fn collect_recent_jsonl_files(
-    project_path: PathBuf,
-    modified_after: SystemTime,
-    files: &mut Vec<(PathBuf, SystemTime)>,
-) {
-    if let Ok(entries) = fs::read_dir(project_path) {
-        for entry in entries.flatten() {
-            let Ok(metadata) = entry.metadata() else {
-                continue;
-            };
+#[cfg(test)]
+mod tests {
+    use super::recent_session_logs;
+    use std::fs::{self, File, FileTimes};
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-            // We only care about `.jsonl` files.
-            if !metadata.is_file()
-                || entry.path().extension().and_then(|ext| ext.to_str()) != Some("jsonl")
-            {
-                continue;
-            }
+    struct TestDir(PathBuf);
 
-            // Check if the file was modified recently enough to be included.
-            if let Ok(modified_time) = metadata.modified() {
-                if modified_time > modified_after {
-                    files.push((entry.path(), modified_time));
-                }
-            }
+    impl TestDir {
+        fn new() -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "claudego-session-discovery-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).unwrap();
+            Self(path)
         }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn touch(path: &Path, modified: SystemTime) {
+        fs::write(path, b"{}\n").unwrap();
+        File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_times(FileTimes::new().set_modified(modified))
+            .unwrap();
+    }
+
+    #[test]
+    fn finds_direct_and_nested_recent_jsonl_only() {
+        let root = TestDir::new();
+        let cutoff = SystemTime::now() - Duration::from_secs(60);
+        let recent = SystemTime::now();
+        let stale = cutoff - Duration::from_secs(1);
+        let direct = root.0.join("direct.jsonl");
+        let nested_dir = root.0.join("project/deeper");
+        fs::create_dir_all(&nested_dir).unwrap();
+        let nested = nested_dir.join("nested.jsonl");
+        touch(&direct, recent);
+        touch(&nested, recent);
+        touch(&root.0.join("stale.jsonl"), stale);
+        touch(&root.0.join("wrong.txt"), recent);
+
+        let found: Vec<_> = recent_session_logs(&root.0, cutoff)
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect();
+
+        assert_eq!(found.len(), 2);
+        assert!(found.contains(&direct));
+        assert!(found.contains(&nested));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn does_not_follow_directory_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = TestDir::new();
+        let outside = TestDir::new();
+        let hidden = outside.0.join("hidden.jsonl");
+        touch(&hidden, SystemTime::now());
+        symlink(&outside.0, root.0.join("linked-project")).unwrap();
+
+        assert!(recent_session_logs(&root.0, SystemTime::UNIX_EPOCH).is_empty());
     }
 }
