@@ -1,6 +1,6 @@
 use crate::cli::{stream_json_resume_command, CommandSpec};
 use crate::logging::log_to_file;
-use crate::models::{mark_output_activity, OutputActivity, SharedAppState};
+use crate::models::{mark_output_activity, ChildOutcome, OutputActivity, SharedAppState};
 use crate::resume::StreamResumeCommand;
 use crate::watcher::scan::{rate_limit_from_message, RateLimitInfo};
 use anyhow::Result;
@@ -29,7 +29,7 @@ pub enum StreamLineResult {
 
 #[derive(Debug, PartialEq, Eq)]
 enum StreamProcessAction {
-    Exit,
+    Exit(ChildOutcome),
     Restart,
 }
 
@@ -109,7 +109,7 @@ pub async fn run_stream_json_print(
     command: CommandSpec,
     state: SharedAppState,
     mut resume_rx: mpsc::UnboundedReceiver<StreamResumeCommand>,
-) -> Result<()> {
+) -> Result<ChildOutcome> {
     let latest_session_id = Arc::new(Mutex::new(None::<String>));
     let initial_program = command.program.clone();
     let mut next_command = command;
@@ -123,8 +123,9 @@ pub async fn run_stream_json_print(
         )
         .await?;
 
-        if action == StreamProcessAction::Exit {
-            return Ok(());
+        match action {
+            StreamProcessAction::Exit(outcome) => return Ok(outcome),
+            StreamProcessAction::Restart => {}
         }
 
         let Some(session_id) = latest_session_id
@@ -135,7 +136,7 @@ pub async fn run_stream_json_print(
             log_to_file(
                 "[Stream JSON] Cannot resume: no session id was observed in stream output.",
             );
-            return Ok(());
+            return Ok(ChildOutcome::Code(0));
         };
 
         next_command = resume_command_with_program(&initial_program, &session_id);
@@ -218,18 +219,16 @@ async fn run_one_stream_process(
     stderr_task.await??;
     parser_task.await?;
 
-    if let Some(status) = child_status {
-        if !status.success() {
-            anyhow::bail!("stream child exited with status {status}");
-        }
-    }
-
     if live_restart_requested {
         return Ok(StreamProcessAction::Restart);
     }
 
+    let outcome = child_status
+        .map(ChildOutcome::from_std)
+        .unwrap_or(ChildOutcome::Code(0));
     Ok(await_resume_after_exit(
         lockout_recorded_since(&state, starting_lockout_revision),
+        outcome,
         resume_rx,
     )
     .await)
@@ -245,6 +244,7 @@ fn lockout_recorded_since(state: &SharedAppState, starting_revision: u64) -> boo
 
 async fn await_resume_after_exit(
     resume_pending: bool,
+    original_outcome: ChildOutcome,
     resume_rx: &mut mpsc::UnboundedReceiver<StreamResumeCommand>,
 ) -> StreamProcessAction {
     if let Ok(StreamResumeCommand::Continue) = resume_rx.try_recv() {
@@ -252,7 +252,7 @@ async fn await_resume_after_exit(
     }
 
     if !resume_pending {
-        return StreamProcessAction::Exit;
+        return StreamProcessAction::Exit(original_outcome);
     }
 
     while let Some(command) = resume_rx.recv().await {
@@ -261,7 +261,7 @@ async fn await_resume_after_exit(
         }
     }
 
-    StreamProcessAction::Exit
+    StreamProcessAction::Exit(original_outcome)
 }
 
 async fn restart_running_child(child: &mut tokio::process::Child) -> Result<()> {
@@ -383,10 +383,11 @@ fn find_string_value(value: &Value, matches: &dyn Fn(&str) -> bool) -> Option<St
 mod tests {
     use super::{
         await_resume_after_exit, lockout_recorded_since, parse_stream_line, pump_raw_output,
-        resume_command_with_program, StreamLineResult, StreamProcessAction, MAX_PARSER_LINE_BYTES,
+        resume_command_with_program, run_one_stream_process, run_stream_json_print,
+        StreamLineResult, StreamProcessAction, MAX_PARSER_LINE_BYTES,
     };
     use crate::cli::CommandSpec;
-    use crate::models::{output_is_hot, AppState};
+    use crate::models::{output_is_hot, AppState, ChildOutcome};
     use crate::watcher::scan::RateLimitInfo;
     use chrono::{DateTime, Duration as ChronoDuration, Local};
     use std::collections::VecDeque;
@@ -647,8 +648,9 @@ mod tests {
     async fn waits_for_continue_after_child_exit_when_lockout_is_active() {
         let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
 
-        let wait_task =
-            tokio::spawn(async move { await_resume_after_exit(true, &mut resume_rx).await });
+        let wait_task = tokio::spawn(async move {
+            await_resume_after_exit(true, ChildOutcome::Code(7), &mut resume_rx).await
+        });
 
         tokio::time::sleep(Duration::from_millis(25)).await;
         assert!(!wait_task.is_finished());
@@ -671,9 +673,89 @@ mod tests {
             .expect("queue continue");
 
         assert!(matches!(
-            await_resume_after_exit(false, &mut resume_rx).await,
+            await_resume_after_exit(false, ChildOutcome::Code(0), &mut resume_rx).await,
             StreamProcessAction::Restart
         ));
+    }
+
+    #[tokio::test]
+    async fn closed_resume_channel_returns_original_nonzero_outcome() {
+        let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+        drop(resume_tx);
+
+        assert_eq!(
+            await_resume_after_exit(true, ChildOutcome::Code(7), &mut resume_rx).await,
+            StreamProcessAction::Exit(ChildOutcome::Code(7))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn nonzero_child_without_lockout_returns_its_code() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let (_resume_tx, mut resume_rx) = mpsc::unbounded_channel();
+
+        let action = run_one_stream_process(
+            CommandSpec {
+                program: "/bin/sh".into(),
+                args: vec!["-c".into(), "exit 7".into()],
+            },
+            state,
+            Arc::new(Mutex::new(None)),
+            &mut resume_rx,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(action, StreamProcessAction::Exit(ChildOutcome::Code(7)));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restarted_child_outcome_becomes_final() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "claudego-stream-outcome-{}-{nonce}.sh",
+            std::process::id()
+        ));
+        let ready_path = path.with_extension("ready");
+        std::fs::write(
+            &path,
+            b"#!/bin/sh\ncase \" $* \" in *\" --resume \"*) exit 9;; esac\nprintf '{\"type\":\"system\",\"session_id\":\"session-123\"}\\n'\n: > \"$1\"\nexec /bin/sleep 2\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let (resume_tx, resume_rx) = mpsc::unbounded_channel();
+        let command = CommandSpec {
+            program: path.to_string_lossy().into_owned(),
+            args: vec![ready_path.to_string_lossy().into_owned()],
+        };
+        let task = tokio::spawn(run_stream_json_print(command, state, resume_rx));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while !ready_path.is_file() {
+            assert!(tokio::time::Instant::now() < deadline, "helper not ready");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        resume_tx
+            .send(crate::resume::StreamResumeCommand::Continue)
+            .unwrap();
+
+        let outcome = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .expect("stream runner timed out")
+            .expect("stream runner task failed")
+            .expect("stream runner returned an error");
+
+        assert_eq!(outcome, ChildOutcome::Code(9));
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(ready_path).unwrap();
     }
 
     #[test]

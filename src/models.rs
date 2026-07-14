@@ -5,6 +5,35 @@ use std::sync::{Arc, Mutex};
 
 pub type OutputActivity = Arc<AtomicU64>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildOutcome {
+    Code(u8),
+    NoPortableCode,
+}
+
+impl ChildOutcome {
+    pub fn from_std(status: std::process::ExitStatus) -> Self {
+        status
+            .code()
+            .and_then(|code| u8::try_from(code).ok())
+            .map(Self::Code)
+            .unwrap_or(Self::NoPortableCode)
+    }
+
+    pub fn from_pty(status: portable_pty::ExitStatus) -> Self {
+        u8::try_from(status.exit_code())
+            .map(Self::Code)
+            .unwrap_or(Self::NoPortableCode)
+    }
+
+    pub fn wrapper_code(self) -> u8 {
+        match self {
+            Self::Code(code) => code,
+            Self::NoPortableCode => 1,
+        }
+    }
+}
+
 pub struct AppState {
     pub lockout_target_time: Option<chrono::DateTime<chrono::Local>>,
     pub latest_rate_limit_event_time: Option<chrono::DateTime<chrono::Local>>,
@@ -59,7 +88,7 @@ pub fn output_is_hot(activity: &AtomicU64, threshold: std::time::Duration) -> bo
 
 #[cfg(test)]
 mod tests {
-    use super::{mark_output_activity, output_is_hot, AppState};
+    use super::{mark_output_activity, output_is_hot, AppState, ChildOutcome};
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
@@ -96,5 +125,28 @@ mod tests {
             state.resume_exhausted_revision,
             Some(state.lockout_revision)
         );
+    }
+
+    #[test]
+    fn portable_child_outcomes_preserve_only_wrapper_codes() {
+        assert_eq!(
+            ChildOutcome::from_pty(portable_pty::ExitStatus::with_exit_code(7)),
+            ChildOutcome::Code(7)
+        );
+        assert_eq!(
+            ChildOutcome::from_pty(portable_pty::ExitStatus::with_exit_code(256)),
+            ChildOutcome::NoPortableCode
+        );
+        assert_eq!(ChildOutcome::NoPortableCode.wrapper_code(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signal_exit_has_no_portable_numeric_code() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(9);
+
+        assert_eq!(ChildOutcome::from_std(status), ChildOutcome::NoPortableCode);
     }
 }
