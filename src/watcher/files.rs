@@ -55,7 +55,10 @@ mod tests {
     use super::recent_session_logs;
     use std::fs::{self, File, FileTimes};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
     struct TestDir(PathBuf);
 
@@ -66,8 +69,9 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "claudego-session-discovery-{}-{nonce}",
-                std::process::id()
+                "claudego-session-discovery-{}-{nonce}-{}",
+                std::process::id(),
+                NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed),
             ));
             fs::create_dir(&path).unwrap();
             Self(path)

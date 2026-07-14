@@ -36,7 +36,7 @@ fn candidate_port_files_in(temp_dir: &Path, pid: Option<u32>) -> Result<Vec<Path
         };
         candidates.push((modified, entry.path()));
     }
-    candidates.sort_by(|left, right| right.0.cmp(&left.0));
+    candidates.sort_by_key(|candidate| std::cmp::Reverse(candidate.0));
     Ok(candidates.into_iter().map(|(_, path)| path).collect())
 }
 
@@ -99,17 +99,13 @@ fn main() -> Result<()> {
             continue;
         }
 
-        for result in rx {
-            if let Ok(event) = result {
-                if is_relevant_port_file_event(&event, pid) {
-                    thread::sleep(Duration::from_millis(50));
-                    if try_connect_and_stream(pid).is_ok() {
-                        println!(
-                            "\nConnection to claudego process lost. Waiting for it to restart..."
-                        );
-                    }
-                    break;
+        for event in rx.into_iter().flatten() {
+            if is_relevant_port_file_event(&event, pid) {
+                thread::sleep(Duration::from_millis(50));
+                if try_connect_and_stream(pid).is_ok() {
+                    println!("\nConnection to claudego process lost. Waiting for it to restart...");
                 }
+                break;
             }
         }
     }
