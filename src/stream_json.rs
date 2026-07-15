@@ -1,7 +1,7 @@
 use crate::cli::{stream_json_resume_command, CommandSpec};
+use crate::harness::{ResumeOutcome, ResumeSink, RunContext, RunFuture, Runner};
 use crate::logging::log_to_file;
 use crate::models::{mark_output_activity, ChildOutcome, OutputActivity, SharedAppState};
-use crate::resume::StreamResumeCommand;
 use crate::watcher::scan::{rate_limit_from_message, RateLimitInfo};
 use anyhow::Result;
 use chrono::{DateTime, Local};
@@ -13,6 +13,50 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 
 const MAX_PARSER_LINE_BYTES: usize = 1024 * 1024;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum StreamResumeCommand {
+    Continue,
+}
+
+struct StreamResumeSink {
+    sender: mpsc::UnboundedSender<StreamResumeCommand>,
+}
+
+impl ResumeSink for StreamResumeSink {
+    fn resume(&self) -> ResumeOutcome {
+        match self.sender.send(StreamResumeCommand::Continue) {
+            Ok(()) => ResumeOutcome::Sent,
+            Err(_) => ResumeOutcome::DefiniteFailure(
+                "stream-json runner is no longer available".to_string(),
+            ),
+        }
+    }
+}
+
+pub struct StreamJsonRunner {
+    command: CommandSpec,
+}
+
+impl StreamJsonRunner {
+    pub fn new(command: CommandSpec) -> Self {
+        Self { command }
+    }
+}
+
+impl Runner for StreamJsonRunner {
+    fn run(self: Box<Self>, context: RunContext) -> RunFuture {
+        Box::pin(async move {
+            let (resume_tx, resume_rx) = mpsc::unbounded_channel();
+            crate::monitor::spawn_lockout_monitor(
+                Arc::clone(&context.state),
+                context.monitor,
+                Arc::new(StreamResumeSink { sender: resume_tx }),
+            );
+            run_stream_json_print(self.command, context.state, resume_rx).await
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct StreamJsonSignal {
@@ -105,7 +149,7 @@ where
     }
 }
 
-pub async fn run_stream_json_print(
+async fn run_stream_json_print(
     command: CommandSpec,
     state: SharedAppState,
     mut resume_rx: mpsc::UnboundedReceiver<StreamResumeCommand>,
@@ -384,9 +428,11 @@ mod tests {
     use super::{
         await_resume_after_exit, lockout_recorded_since, parse_stream_line, pump_raw_output,
         resume_command_with_program, run_one_stream_process, run_stream_json_print,
-        StreamLineResult, StreamProcessAction, MAX_PARSER_LINE_BYTES,
+        StreamLineResult, StreamProcessAction, StreamResumeCommand, StreamResumeSink,
+        MAX_PARSER_LINE_BYTES,
     };
     use crate::cli::CommandSpec;
+    use crate::harness::{ResumeOutcome, ResumeSink};
     use crate::models::{output_is_hot, AppState, ChildOutcome};
     use crate::watcher::scan::RateLimitInfo;
     use chrono::{DateTime, Duration as ChronoDuration, Local};
@@ -427,6 +473,27 @@ mod tests {
             }
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    async fn stream_resume_sends_continue_command() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let sink = StreamResumeSink { sender };
+
+        assert_eq!(sink.resume(), ResumeOutcome::Sent);
+        assert_eq!(receiver.recv().await, Some(StreamResumeCommand::Continue));
+    }
+
+    #[test]
+    fn closed_stream_is_a_definite_failure() {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        drop(receiver);
+        let sink = StreamResumeSink { sender };
+
+        assert_eq!(
+            sink.resume(),
+            ResumeOutcome::DefiniteFailure("stream-json runner is no longer available".to_string())
+        );
     }
 
     #[test]
@@ -656,7 +723,7 @@ mod tests {
         assert!(!wait_task.is_finished());
 
         resume_tx
-            .send(crate::resume::StreamResumeCommand::Continue)
+            .send(StreamResumeCommand::Continue)
             .expect("send continue");
 
         assert!(matches!(
@@ -669,7 +736,7 @@ mod tests {
     async fn consumes_queued_continue_after_child_exit_without_lockout() {
         let (resume_tx, mut resume_rx) = mpsc::unbounded_channel();
         resume_tx
-            .send(crate::resume::StreamResumeCommand::Continue)
+            .send(StreamResumeCommand::Continue)
             .expect("queue continue");
 
         assert!(matches!(
@@ -743,9 +810,7 @@ mod tests {
             assert!(tokio::time::Instant::now() < deadline, "helper not ready");
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        resume_tx
-            .send(crate::resume::StreamResumeCommand::Continue)
-            .unwrap();
+        resume_tx.send(StreamResumeCommand::Continue).unwrap();
 
         let outcome = tokio::time::timeout(Duration::from_secs(3), task)
             .await

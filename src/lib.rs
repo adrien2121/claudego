@@ -7,6 +7,7 @@ pub mod monitor;
 pub mod paths;
 pub mod pty_bridge;
 pub mod resume;
+pub mod runners;
 pub mod stream_json;
 pub mod terminal;
 pub mod time_format;

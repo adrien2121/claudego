@@ -1,70 +1,44 @@
-use crate::harness::{ResumeOutcome as HarnessResumeOutcome, ResumeSink};
+use crate::harness::{ResumeOutcome, ResumeSink};
 use crate::pty_bridge::SharedPtyWriter;
 use std::io::Write;
-use tokio::sync::mpsc;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum StreamResumeCommand {
-    Continue,
+pub struct PtyResumeSink {
+    writer: SharedPtyWriter,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResumeOutcome {
-    Sent,
-    DefiniteFailure(String),
-    AmbiguousFailure(String),
-}
-
-#[derive(Clone)]
-pub enum ResumeTarget {
-    Pty(SharedPtyWriter),
-    StreamJson(mpsc::UnboundedSender<StreamResumeCommand>),
-}
-
-impl ResumeTarget {
-    pub fn resume(&self) -> ResumeOutcome {
-        match self {
-            ResumeTarget::Pty(writer) => {
-                let mut writer = writer.lock().unwrap_or_else(|e| e.into_inner());
-                if let Err(error) = writer.write_all(b"continue\r") {
-                    return ResumeOutcome::AmbiguousFailure(format!(
-                        "failed to write PTY continue command: {error}"
-                    ));
-                }
-                match writer.flush() {
-                    Ok(()) => ResumeOutcome::Sent,
-                    Err(error) => ResumeOutcome::AmbiguousFailure(format!(
-                        "failed to flush PTY continue command: {error}"
-                    )),
-                }
-            }
-            ResumeTarget::StreamJson(tx) => match tx.send(StreamResumeCommand::Continue) {
-                Ok(()) => ResumeOutcome::Sent,
-                Err(_) => ResumeOutcome::DefiniteFailure(
-                    "stream-json runner is no longer available".to_string(),
-                ),
-            },
-        }
+impl PtyResumeSink {
+    pub fn new(writer: SharedPtyWriter) -> Self {
+        Self { writer }
     }
 }
 
-impl ResumeSink for ResumeTarget {
-    fn resume(&self) -> HarnessResumeOutcome {
-        match ResumeTarget::resume(self) {
-            ResumeOutcome::Sent => HarnessResumeOutcome::Sent,
-            ResumeOutcome::DefiniteFailure(error) => HarnessResumeOutcome::DefiniteFailure(error),
-            ResumeOutcome::AmbiguousFailure(error) => HarnessResumeOutcome::AmbiguousFailure(error),
+impl ResumeSink for PtyResumeSink {
+    fn resume(&self) -> ResumeOutcome {
+        let mut writer = self
+            .writer
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Err(error) = writer.write_all(b"continue\r") {
+            return ResumeOutcome::AmbiguousFailure(format!(
+                "failed to write PTY continue command: {error}"
+            ));
+        }
+        match writer.flush() {
+            Ok(()) => ResumeOutcome::Sent,
+            Err(error) => ResumeOutcome::AmbiguousFailure(format!(
+                "failed to flush PTY continue command: {error}"
+            )),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ResumeOutcome, ResumeTarget, StreamResumeCommand};
+    use super::PtyResumeSink;
+    use crate::harness::{ResumeOutcome, ResumeSink};
     use crate::pty_bridge::SharedPtyWriter;
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
-    use tokio::sync::mpsc;
 
     #[derive(Default)]
     struct MemoryWriter {
@@ -89,29 +63,9 @@ mod tests {
             bytes: Arc::clone(&bytes),
         };
         let writer: SharedPtyWriter = Arc::new(Mutex::new(Box::new(writer)));
+        let sink = PtyResumeSink::new(writer);
 
-        assert_eq!(ResumeTarget::Pty(writer).resume(), ResumeOutcome::Sent);
-
+        assert_eq!(sink.resume(), ResumeOutcome::Sent);
         assert_eq!(&*bytes.lock().unwrap(), b"continue\r");
-    }
-
-    #[tokio::test]
-    async fn stream_resume_sends_continue_command() {
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        assert_eq!(ResumeTarget::StreamJson(tx).resume(), ResumeOutcome::Sent);
-
-        assert_eq!(rx.recv().await, Some(StreamResumeCommand::Continue));
-    }
-
-    #[tokio::test]
-    async fn closed_stream_is_a_definite_failure() {
-        let (tx, rx) = mpsc::unbounded_channel();
-        drop(rx);
-
-        assert_eq!(
-            ResumeTarget::StreamJson(tx).resume(),
-            ResumeOutcome::DefiniteFailure("stream-json runner is no longer available".to_string())
-        );
     }
 }

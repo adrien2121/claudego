@@ -1,8 +1,33 @@
 use anyhow::Result;
 use botsitter::app;
-use botsitter::cli::CommandSpec;
+use botsitter::cli::{select_runner, CommandSpec, RunnerKind};
+use botsitter::harness::{MonitorSpec, RunPlan, SessionRoot};
+use botsitter::runners::pty::PtyRunner;
+use botsitter::stream_json::StreamJsonRunner;
 use clap::Parser;
 use keepawake::Builder;
+use std::path::PathBuf;
+use std::sync::Arc;
+
+struct LegacySessionRoot;
+
+impl SessionRoot for LegacySessionRoot {
+    fn resolve(&self) -> Option<PathBuf> {
+        dirs::home_dir().map(|home| home.join(".claude/projects"))
+    }
+}
+
+fn prepare(command: CommandSpec) -> RunPlan {
+    let monitor = MonitorSpec {
+        root: Arc::new(LegacySessionRoot),
+        parser: Arc::new(botsitter::watcher::scan::TranscriptLineParser),
+    };
+    let runner = match select_runner(&command) {
+        RunnerKind::PtyInteractive => Box::new(PtyRunner::new(command)) as _,
+        RunnerKind::StreamJsonPrint => Box::new(StreamJsonRunner::new(command)) as _,
+    };
+    RunPlan { monitor, runner }
+}
 
 /// A fire-and-forget wrapper for the claude CLI that automatically handles rate limits.
 #[derive(Parser, Debug)]
@@ -50,7 +75,7 @@ async fn main() -> Result<std::process::ExitCode> {
         CommandSpec { program, args }
     };
 
-    let outcome = app::run(cli.show_logs, command_spec).await?;
+    let outcome = app::run(cli.show_logs, prepare(command_spec)).await?;
     drop(_awake_guard);
     Ok(std::process::ExitCode::from(outcome.wrapper_code()))
 }
