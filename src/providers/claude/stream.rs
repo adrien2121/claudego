@@ -1,8 +1,9 @@
-use crate::cli::{stream_json_resume_command, CommandSpec};
-use crate::harness::{ResumeOutcome, ResumeSink, RunContext, RunFuture, Runner};
+use super::cli::stream_resume_command;
+use super::transcript::limit_update_from_message;
+use crate::cli::CommandSpec;
+use crate::harness::{LimitUpdate, ResumeOutcome, ResumeSink, RunContext, RunFuture, Runner};
 use crate::logging::log_to_file;
 use crate::models::{mark_output_activity, ChildOutcome, OutputActivity, SharedAppState};
-use crate::watcher::scan::{rate_limit_from_message, RateLimitInfo};
 use anyhow::Result;
 use chrono::{DateTime, Local};
 use serde_json::Value;
@@ -34,17 +35,17 @@ impl ResumeSink for StreamResumeSink {
     }
 }
 
-pub struct StreamJsonRunner {
+pub(super) struct ClaudeStreamRunner {
     command: CommandSpec,
 }
 
-impl StreamJsonRunner {
-    pub fn new(command: CommandSpec) -> Self {
+impl ClaudeStreamRunner {
+    pub(super) fn new(command: CommandSpec) -> Self {
         Self { command }
     }
 }
 
-impl Runner for StreamJsonRunner {
+impl Runner for ClaudeStreamRunner {
     fn run(self: Box<Self>, context: RunContext) -> RunFuture {
         Box::pin(async move {
             let (resume_tx, resume_rx) = mpsc::unbounded_channel();
@@ -59,13 +60,13 @@ impl Runner for StreamJsonRunner {
 }
 
 #[derive(Debug)]
-pub struct StreamJsonSignal {
-    pub session_id: Option<String>,
-    pub rate_limit: Option<RateLimitInfo>,
+struct StreamJsonSignal {
+    session_id: Option<String>,
+    rate_limit: Option<LimitUpdate>,
 }
 
 #[derive(Debug)]
-pub enum StreamLineResult {
+enum StreamLineResult {
     Signal(StreamJsonSignal),
     Ignored,
     InvalidJson,
@@ -77,7 +78,7 @@ enum StreamProcessAction {
     Restart,
 }
 
-pub(crate) async fn pump_raw_output<R, W>(
+async fn pump_raw_output<R, W>(
     mut reader: R,
     mut writer: W,
     line_tx: mpsc::Sender<String>,
@@ -279,11 +280,8 @@ async fn run_one_stream_process(
 }
 
 fn lockout_recorded_since(state: &SharedAppState, starting_revision: u64) -> bool {
-    state
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .lockout_revision
-        != starting_revision
+    let state = state.lock().unwrap_or_else(|e| e.into_inner());
+    state.lockout_revision != starting_revision && state.lockout_target_time.is_some()
 }
 
 async fn await_resume_after_exit(
@@ -325,7 +323,7 @@ async fn restart_running_child(child: &mut tokio::process::Child) -> Result<()> 
 }
 
 fn resume_command_with_program(program: &str, session_id: &str) -> CommandSpec {
-    let mut command = stream_json_resume_command(session_id);
+    let mut command = stream_resume_command(session_id);
     command.program = program.to_string();
     command
 }
@@ -342,7 +340,7 @@ async fn parse_stream_lines(
                     *latest_session_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(session_id);
                 }
                 if let Some(limit) = signal.rate_limit {
-                    crate::monitor::record_lockout(&state, limit, "stream-json");
+                    crate::monitor::record_limit_update(&state, limit);
                 }
             }
             StreamLineResult::InvalidJson => {
@@ -353,7 +351,7 @@ async fn parse_stream_lines(
     }
 }
 
-pub fn parse_stream_line(line: &str) -> StreamLineResult {
+fn parse_stream_line(line: &str) -> StreamLineResult {
     let Ok(value) = serde_json::from_str::<Value>(line) else {
         return StreamLineResult::InvalidJson;
     };
@@ -371,7 +369,7 @@ pub fn parse_stream_line(line: &str) -> StreamLineResult {
     }
 }
 
-fn extract_rate_limit(value: &Value) -> Option<RateLimitInfo> {
+fn extract_rate_limit(value: &Value) -> Option<LimitUpdate> {
     if value.get("error").and_then(Value::as_str) != Some("rate_limit") {
         return None;
     }
@@ -382,7 +380,7 @@ fn extract_rate_limit(value: &Value) -> Option<RateLimitInfo> {
         .with_timezone(&Local);
     let message = find_rate_limit_text(value)?;
 
-    rate_limit_from_message(log_time, &message)
+    limit_update_from_message(log_time, &message, Local::now())
 }
 
 fn find_rate_limit_text(value: &Value) -> Option<String> {
@@ -432,9 +430,8 @@ mod tests {
         MAX_PARSER_LINE_BYTES,
     };
     use crate::cli::CommandSpec;
-    use crate::harness::{ResumeOutcome, ResumeSink};
+    use crate::harness::{LimitState, LimitUpdate, ResumeOutcome, ResumeSink};
     use crate::models::{output_is_hot, AppState, ChildOutcome};
-    use crate::watcher::scan::RateLimitInfo;
     use chrono::{DateTime, Duration as ChronoDuration, Local};
     use std::collections::VecDeque;
     use std::pin::Pin;
@@ -544,8 +541,10 @@ mod tests {
                 .unwrap()
                 .with_timezone(&Local)
         );
-        assert_eq!(limit.display_str, "5:30pm");
-        assert_eq!(limit.raw_message, "Claude limit reached; resets 5:30pm");
+        assert!(matches!(
+            limit.state,
+            LimitState::Locked { ref display, .. } if display == "5:30pm"
+        ));
     }
 
     #[test]
@@ -574,18 +573,46 @@ mod tests {
 
         assert!(!lockout_recorded_since(&state, starting_revision));
 
-        crate::monitor::record_lockout(
+        let event_time = Local::now();
+        crate::monitor::record_limit_update(
             &state,
-            RateLimitInfo {
-                event_time: Local::now(),
-                target_time: Local::now() + ChronoDuration::hours(2),
-                display_str: "later".to_string(),
-                raw_message: "rate limit".to_string(),
+            LimitUpdate {
+                event_time,
+                state: LimitState::Locked {
+                    target_time: event_time + ChronoDuration::hours(2),
+                    display: "later".to_string(),
+                },
             },
-            "stream-json",
         );
 
         assert!(lockout_recorded_since(&state, starting_revision));
+    }
+
+    #[test]
+    fn newer_clear_does_not_leave_resume_pending() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let starting_revision = state.lock().unwrap().lockout_revision;
+        let event_time = Local::now();
+
+        crate::monitor::record_limit_update(
+            &state,
+            LimitUpdate {
+                event_time,
+                state: LimitState::Locked {
+                    target_time: event_time + ChronoDuration::hours(2),
+                    display: "later".to_string(),
+                },
+            },
+        );
+        crate::monitor::record_limit_update(
+            &state,
+            LimitUpdate {
+                event_time: event_time + ChronoDuration::seconds(1),
+                state: LimitState::Clear,
+            },
+        );
+
+        assert!(!lockout_recorded_since(&state, starting_revision));
     }
 
     #[tokio::test]

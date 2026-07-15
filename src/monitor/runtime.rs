@@ -220,26 +220,14 @@ pub(super) async fn scan_and_update_state(
     }
 }
 
-pub(super) fn record_lockout(
-    state: &SharedAppState,
-    limit_info: crate::watcher::scan::RateLimitInfo,
-    source: &str,
-) {
-    log_to_file(&format!(
-        "[LOCKOUT DETECTED] Rate limit hit from {source}. Target: {}",
-        limit_info.display_str
-    ));
-    apply_limit_update(
-        state,
-        LimitUpdate {
-            event_time: limit_info.event_time,
-            state: LimitState::Locked {
-                target_time: limit_info.target_time,
-                display: limit_info.display_str,
-            },
-        },
-        true,
-    );
+pub(super) fn record_limit_update(state: &SharedAppState, update: LimitUpdate) {
+    match &update.state {
+        LimitState::Locked { display, .. } => log_to_file(&format!(
+            "[LOCKOUT DETECTED] Runner reported a rate limit. Target: {display}"
+        )),
+        LimitState::Clear => log_to_file("[LIMIT UPDATE] Runner reported cleared state."),
+    }
+    apply_limit_update(state, update, true);
 }
 
 pub(crate) fn apply_limit_update(
@@ -321,14 +309,12 @@ async fn handle_expiry_with<R: ResumeAttempt>(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_limit_update, handle_expiry_with, record_lockout, scan_and_update_state,
+        apply_limit_update, handle_expiry_with, record_limit_update, scan_and_update_state,
         scan_mmap_range_for_test, scan_one_path, ScanFailure,
     };
-    use crate::harness::{LimitState, LimitUpdate, ResumeOutcome};
+    use crate::harness::{LimitState, LimitUpdate, ParseOutcome, ResumeOutcome, TranscriptParser};
     use crate::models::AppState;
-    use crate::watcher::scan::RateLimitInfo;
-    use crate::watcher::scan::TranscriptLineParser;
-    use chrono::{Duration, Local};
+    use chrono::{DateTime, Duration, Local};
     use std::collections::HashSet;
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -336,7 +322,34 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-    const PARSER: TranscriptLineParser = TranscriptLineParser;
+    struct FixedParser;
+
+    impl TranscriptParser for FixedParser {
+        fn parse_line(&self, line: &str, _now: DateTime<Local>) -> ParseOutcome {
+            let Some(value) = line.strip_prefix("limit ") else {
+                return ParseOutcome::Ignored;
+            };
+            let Some((event, target)) = value.split_once(' ') else {
+                return ParseOutcome::Ignored;
+            };
+            let Ok(event_time) = DateTime::parse_from_rfc3339(event) else {
+                return ParseOutcome::Ignored;
+            };
+            let Ok(target_time) = DateTime::parse_from_rfc3339(target) else {
+                return ParseOutcome::Ignored;
+            };
+            let target_time = target_time.with_timezone(&Local);
+            ParseOutcome::Update(LimitUpdate {
+                event_time: event_time.with_timezone(&Local),
+                state: LimitState::Locked {
+                    target_time,
+                    display: target_time.to_rfc3339(),
+                },
+            })
+        }
+    }
+
+    const PARSER: FixedParser = FixedParser;
 
     fn unique_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -381,11 +394,8 @@ mod tests {
         let old_size = std::fs::metadata(&path).unwrap().len();
         let state = state_with_cursor(path.clone(), old_size);
         let now = Local::now();
-        let reset = (now + Duration::hours(2)).format("%-I:%M%P");
-        let row = format!(
-            "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"You've hit your session limit · resets {reset} (America/Toronto)\"}}]}}}}\n",
-            now.to_rfc3339()
-        );
+        let target = now + Duration::hours(2);
+        let row = format!("limit {} {}\n", now.to_rfc3339(), target.to_rfc3339());
 
         let first = super::scan_stable_range_with(&path, old_size, &PARSER, || {
             OpenOptions::new()
@@ -478,12 +488,13 @@ mod tests {
         Arc::new(Mutex::new(app))
     }
 
-    fn limit(event: chrono::DateTime<Local>, target: chrono::DateTime<Local>) -> RateLimitInfo {
-        RateLimitInfo {
+    fn limit(event: chrono::DateTime<Local>, target: chrono::DateTime<Local>) -> LimitUpdate {
+        LimitUpdate {
             event_time: event,
-            target_time: target,
-            display_str: target.to_rfc3339(),
-            raw_message: "fixture".to_string(),
+            state: LimitState::Locked {
+                target_time: target,
+                display: target.to_rfc3339(),
+            },
         }
     }
 
@@ -530,7 +541,7 @@ mod tests {
         let now = Local::now();
         let due = now - Duration::seconds(1);
         let state = Arc::new(Mutex::new(AppState::new()));
-        record_lockout(&state, limit(now, due), "test");
+        record_limit_update(&state, limit(now, due));
         let resume = ScriptedResume::outcomes(vec![ResumeOutcome::Sent]);
 
         assert!(state.lock().unwrap().lockout_target_time.unwrap() <= Local::now());
@@ -615,11 +626,7 @@ mod tests {
 
         let now = Local::now();
         let target = now + chrono::Duration::hours(2);
-        let reset = target.format("%-I:%M%P").to_string();
-        let row = format!(
-            "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"You've hit your session limit · resets {reset} (America/Toronto)\"}}]}}}}\n",
-            now.to_rfc3339()
-        );
+        let row = format!("limit {} {}\n", now.to_rfc3339(), target.to_rfc3339());
         OpenOptions::new()
             .append(true)
             .open(&path)
@@ -642,28 +649,27 @@ mod tests {
         assert_eq!(
             app.lockout_target_time
                 .expect("watcher target")
-                .format("%-I:%M%P")
-                .to_string(),
-            reset
+                .to_rfc3339(),
+            target.to_rfc3339()
         );
         drop(app);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
-    fn stream_lockout_updates_shared_state() {
+    fn runner_lockout_updates_shared_state() {
         let state = Arc::new(Mutex::new(AppState::new()));
         let target = Local::now() + Duration::minutes(30);
 
-        record_lockout(
+        record_limit_update(
             &state,
-            RateLimitInfo {
+            LimitUpdate {
                 event_time: target,
-                target_time: target,
-                display_str: "5:30pm".to_string(),
-                raw_message: "fixture".to_string(),
+                state: LimitState::Locked {
+                    target_time: target,
+                    display: "5:30pm".to_string(),
+                },
             },
-            "stream-json",
         );
 
         assert_eq!(state.lock().unwrap().lockout_target_time, Some(target));
@@ -674,10 +680,9 @@ mod tests {
         let now = Local::now();
         let state = shared_state_with_lockout(now + Duration::hours(4), 9);
         state.lock().unwrap().latest_rate_limit_event_time = Some(now);
-        record_lockout(
+        record_limit_update(
             &state,
             limit(now + Duration::minutes(1), now + Duration::hours(1)),
-            "test",
         );
         let app = state.lock().unwrap();
         assert_eq!(app.lockout_target_time, Some(now + Duration::hours(1)));
@@ -698,12 +703,11 @@ mod tests {
             app.latest_rate_limit_event_time = Some(now);
             app.resume_exhausted_revision = Some(7);
         }
-        record_lockout(
+        record_limit_update(
             &state,
             limit(now - Duration::seconds(1), now + Duration::hours(3)),
-            "older",
         );
-        record_lockout(&state, limit(now, now + Duration::hours(4)), "equal");
+        record_limit_update(&state, limit(now, now + Duration::hours(4)));
         let app = state.lock().unwrap();
         assert_eq!(app.lockout_target_time, Some(original_target));
         assert_eq!(app.lockout_revision, 7);

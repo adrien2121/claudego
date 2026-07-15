@@ -1,4 +1,4 @@
-use crate::harness::{MonitorSpec, ResumeSink, TranscriptParser};
+use crate::harness::{LimitUpdate, MonitorSpec, ResumeSink, TranscriptParser};
 use crate::logging::log_to_file;
 use crate::models::SharedAppState;
 use crate::time_format::format_duration;
@@ -187,12 +187,8 @@ async fn recovery_control<T>(
     }
 }
 
-pub fn record_lockout(
-    state: &SharedAppState,
-    limit_info: crate::watcher::scan::RateLimitInfo,
-    source: &str,
-) {
-    runtime::record_lockout(state, limit_info, source);
+pub(crate) fn record_limit_update(state: &SharedAppState, update: LimitUpdate) {
+    runtime::record_limit_update(state, update);
 }
 
 #[cfg(test)]

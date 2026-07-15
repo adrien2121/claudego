@@ -1,6 +1,6 @@
 #![cfg(unix)]
 
-use chrono::Timelike;
+use chrono::{Duration as ChronoDuration, Timelike};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -140,7 +140,7 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
             .unwrap()
             .with_nanosecond(0)
             .unwrap();
-        let reset = event_time.format("%-I:%M%P");
+        let reset = (event_time + ChronoDuration::minutes(1)).format("%-I:%M%P");
         writeln!(
             file,
             "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{PRIVATE_MARKER} Claude limit reached; resets {reset}\"}}]}}}}",
@@ -161,7 +161,17 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
         "[LOCKOUT DETECTED] Rate limit hit from file watcher.",
     );
 
-    assert!(child.wait().unwrap().success());
+    for index in 0..128 {
+        fs::write(
+            project.join(format!("flush-{index:03}.jsonl")),
+            b"{\"type\":\"baseline\"}\n",
+        )
+        .unwrap();
+    }
+    wait_for_text(&live, "flush-127.jsonl");
+
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
     reader.join().unwrap();
     let persistent = fs::read_to_string(log_path).unwrap();
     let live = String::from_utf8_lossy(&live.lock().unwrap()).into_owned();
