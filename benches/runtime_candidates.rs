@@ -21,21 +21,91 @@ mod models {
         pub file_size_cache: HashMap<PathBuf, u64>,
         pub lockout_target_time: Option<chrono::DateTime<chrono::Local>>,
         pub latest_rate_limit_event_time: Option<chrono::DateTime<chrono::Local>>,
+        pub resume_exhausted_revision: Option<u64>,
+        pub lockout_revision: u64,
     }
     pub type SharedAppState = Arc<std::sync::Mutex<AppState>>;
+}
+#[allow(dead_code)]
+mod harness {
+    use chrono::{DateTime, Local};
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    pub trait SessionRoot: Send + Sync {
+        fn resolve(&self) -> Option<PathBuf>;
+    }
+
+    pub trait TranscriptParser: Send + Sync {
+        fn parse_line(&self, line: &str, now: DateTime<Local>) -> ParseOutcome;
+    }
+
+    pub enum ParseOutcome {
+        Update(LimitUpdate),
+        Ignored,
+        Diagnostic(ParseDiagnostic),
+    }
+
+    #[derive(Clone)]
+    pub struct LimitUpdate {
+        pub event_time: DateTime<Local>,
+        pub state: LimitState,
+    }
+
+    #[derive(Clone)]
+    pub enum LimitState {
+        Locked {
+            target_time: DateTime<Local>,
+            display: String,
+        },
+        Clear,
+    }
+
+    pub struct ParseDiagnostic;
+
+    impl ParseDiagnostic {
+        pub fn message(&self) -> &'static str {
+            "fixture diagnostic"
+        }
+    }
+
+    #[derive(Clone)]
+    pub struct MonitorSpec {
+        pub root: Arc<dyn SessionRoot>,
+        pub parser: Arc<dyn TranscriptParser>,
+    }
 }
 mod monitor {
     pub mod helpers {
         pub const SCAN_CHUNK_SIZE: usize = 65_536;
+    }
+    pub mod runtime {
+        use crate::harness::{LimitState, LimitUpdate};
+        use crate::models::SharedAppState;
+
+        pub fn apply_limit_update(
+            state: &SharedAppState,
+            update: LimitUpdate,
+            increment_revision: bool,
+        ) -> bool {
+            let mut app = state.lock().unwrap_or_else(|error| error.into_inner());
+            app.latest_rate_limit_event_time = Some(update.event_time);
+            app.lockout_target_time = match update.state {
+                LimitState::Locked { target_time, .. } => Some(target_time),
+                LimitState::Clear => None,
+            };
+            app.resume_exhausted_revision = None;
+            if increment_revision {
+                app.lockout_revision = app.lockout_revision.wrapping_add(1);
+            }
+            true
+        }
     }
 }
 mod watcher {
     pub mod files {
         use std::path::{Path, PathBuf};
         use std::time::SystemTime;
-        pub fn claude_projects_root() -> Option<PathBuf> {
-            dirs::home_dir().map(|home| home.join(".claude/projects"))
-        }
         pub fn recent_session_logs(root: &Path, after: SystemTime) -> Vec<(PathBuf, SystemTime)> {
             let mut files = Vec::new();
             let mut directories = vec![root.to_path_buf()];
@@ -72,28 +142,8 @@ mod watcher {
             files
         }
     }
-    pub mod scan {
-        use chrono::{DateTime, Local};
-        #[allow(dead_code)]
-        #[derive(Debug)]
-        pub struct RateLimitInfo {
-            pub event_time: DateTime<Local>,
-            pub target_time: DateTime<Local>,
-            pub display_str: String,
-            pub raw_message: String,
-        }
-        #[allow(dead_code)]
-        #[derive(Debug)]
-        pub enum InitialScanResult {
-            Found(RateLimitInfo),
-            NoLimitFound,
-        }
-        pub fn scan_content_for_any_limit(_: &str) -> InitialScanResult {
-            InitialScanResult::NoLimitFound
-        }
-    }
 }
-#[allow(clippy::single_component_path_imports)]
+#[allow(clippy::single_component_path_imports, dead_code)]
 #[path = "../src/monitor/startup.rs"]
 mod production_startup;
 
@@ -156,6 +206,19 @@ async fn run() -> Result<()> {
 }
 
 async fn startup_scan(run: usize) -> Result<()> {
+    struct FixedRoot(PathBuf);
+    impl harness::SessionRoot for FixedRoot {
+        fn resolve(&self) -> Option<PathBuf> {
+            Some(self.0.clone())
+        }
+    }
+    struct IgnoreParser;
+    impl harness::TranscriptParser for IgnoreParser {
+        fn parse_line(&self, _: &str, _: chrono::DateTime<chrono::Local>) -> harness::ParseOutcome {
+            harness::ParseOutcome::Ignored
+        }
+    }
+
     let scratch = Scratch::new("startup", run)?;
     let projects = scratch.0.join("home/.claude/projects/bench");
     let tmp = scratch.0.join("tmp");
@@ -193,8 +256,14 @@ async fn startup_scan(run: usize) -> Result<()> {
         file_size_cache: HashMap::new(),
         lockout_target_time: None,
         latest_rate_limit_event_time: None,
+        resume_exhausted_revision: None,
+        lockout_revision: 0,
     }));
-    production_startup::initial_scan(&state);
+    let monitor = harness::MonitorSpec {
+        root: Arc::new(FixedRoot(scratch.0.join("home/.claude/projects"))),
+        parser: Arc::new(IgnoreParser),
+    };
+    production_startup::initial_scan(&state, &monitor);
     let bytes: u64 = state
         .lock()
         .map_err(|_| "state poisoned")?

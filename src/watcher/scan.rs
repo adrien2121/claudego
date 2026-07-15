@@ -1,3 +1,4 @@
+use crate::harness::{LimitState, LimitUpdate, ParseOutcome, TranscriptParser};
 use chrono::{DateTime, Local};
 use serde_json::Value;
 
@@ -10,47 +11,6 @@ pub struct RateLimitInfo {
     pub target_time: DateTime<Local>,
     pub display_str: String,
     pub raw_message: String,
-}
-
-/// The outcome of scanning a block of text for any rate limit message.
-/// Used during the initial startup scan.
-#[derive(Debug)]
-pub(crate) enum InitialScanResult {
-    Found(RateLimitInfo),
-    /// No rate limit messages were found in the scanned content.
-    NoLimitFound,
-}
-
-/// Scans content from the end and returns the result of the first (most recent)
-/// rate limit message found.
-fn scan_content_for_most_recent_limit(content: &str) -> RateLimitLine {
-    for line in content.lines().rev() {
-        let result = parse_rate_limit_line(line);
-        if !matches!(result, RateLimitLine::NoMatch) {
-            return result;
-        }
-    }
-    RateLimitLine::NoMatch
-}
-
-/// Scans string content from the end for the most recent rate limit message.
-///
-/// # Returns
-/// `Option<RateLimitInfo>` - Structured info if a limit is found.
-pub(crate) fn scan_content_for_limit(content: &str) -> Option<RateLimitInfo> {
-    match scan_content_for_most_recent_limit(content) {
-        RateLimitLine::Found(limit) => Some(limit),
-        RateLimitLine::NoMatch => None,
-    }
-}
-
-/// Scans content from the end, returning the first rate limit message found or
-/// indicating that the content has no valid rate-limit row.
-pub(crate) fn scan_content_for_any_limit(content: &str) -> InitialScanResult {
-    match scan_content_for_most_recent_limit(content) {
-        RateLimitLine::Found(limit) => InitialScanResult::Found(limit),
-        RateLimitLine::NoMatch => InitialScanResult::NoLimitFound,
-    }
 }
 
 pub(crate) fn rate_limit_from_message(
@@ -107,23 +67,44 @@ enum RateLimitLine {
     NoMatch,
 }
 
+pub struct TranscriptLineParser;
+
+impl TranscriptParser for TranscriptLineParser {
+    fn parse_line(&self, line: &str, _now: DateTime<Local>) -> ParseOutcome {
+        match parse_rate_limit_line(line) {
+            RateLimitLine::Found(limit) => ParseOutcome::Update(LimitUpdate {
+                event_time: limit.event_time,
+                state: LimitState::Locked {
+                    target_time: limit.target_time,
+                    display: limit.display_str,
+                },
+            }),
+            RateLimitLine::NoMatch => ParseOutcome::Ignored,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{scan_content_for_any_limit, InitialScanResult};
+    use super::TranscriptLineParser;
+    use crate::harness::{LimitState, ParseOutcome, TranscriptParser};
     use chrono::{Local, TimeZone};
 
     #[test]
     fn expired_limit_retains_event_and_target_times() {
         let row = r#"{"timestamp":"2026-07-12T23:00:00-04:00","error":"rate_limit","message":{"content":[{"type":"text","text":"Claude limit reached; resets 2am"}]}}"#;
-        let InitialScanResult::Found(limit) = scan_content_for_any_limit(row) else {
+        let ParseOutcome::Update(limit) = TranscriptLineParser.parse_line(row, Local::now()) else {
             panic!("expected parsed rate-limit event");
         };
         assert_eq!(
             limit.event_time,
             Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 0).unwrap()
         );
+        let LimitState::Locked { target_time, .. } = limit.state else {
+            panic!("expected locked state");
+        };
         assert_eq!(
-            limit.target_time,
+            target_time,
             Local.with_ymd_and_hms(2026, 7, 13, 2, 0, 5).unwrap()
         );
     }
@@ -134,9 +115,16 @@ mod tests {
             "{\"timestamp\":\"2026-07-12T20:00:00-04:00\",\"error\":\"rate_limit\",\"message\":{\"content\":[{\"text\":\"Claude limit reached; resets Jul 14 at 10am\"}]}}\n",
             "{\"timestamp\":\"2026-07-12T23:00:00-04:00\",\"error\":\"rate_limit\",\"message\":{\"content\":[{\"text\":\"Claude limit reached; resets 11pm\"}]}}\n"
         );
-        let InitialScanResult::Found(limit) = scan_content_for_any_limit(content) else {
-            panic!("expected newest event");
-        };
+        let limit = content
+            .lines()
+            .filter_map(
+                |line| match TranscriptLineParser.parse_line(line, Local::now()) {
+                    ParseOutcome::Update(update) => Some(update),
+                    ParseOutcome::Ignored | ParseOutcome::Diagnostic(_) => None,
+                },
+            )
+            .max_by_key(|update| update.event_time)
+            .expect("expected newest event");
         assert_eq!(
             limit.event_time,
             Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 0).unwrap()

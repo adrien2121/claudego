@@ -1,3 +1,4 @@
+use crate::harness::{ResumeOutcome as HarnessResumeOutcome, ResumeSink};
 use crate::pty_bridge::SharedPtyWriter;
 use std::io::Write;
 use tokio::sync::mpsc;
@@ -43,6 +44,16 @@ impl ResumeTarget {
                     "stream-json runner is no longer available".to_string(),
                 ),
             },
+        }
+    }
+}
+
+impl ResumeSink for ResumeTarget {
+    fn resume(&self) -> HarnessResumeOutcome {
+        match ResumeTarget::resume(self) {
+            ResumeOutcome::Sent => HarnessResumeOutcome::Sent,
+            ResumeOutcome::DefiniteFailure(error) => HarnessResumeOutcome::DefiniteFailure(error),
+            ResumeOutcome::AmbiguousFailure(error) => HarnessResumeOutcome::AmbiguousFailure(error),
         }
     }
 }

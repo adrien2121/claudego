@@ -2,12 +2,6 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-/// Returns the path to the root directory where Claude projects are stored.
-pub fn claude_projects_root() -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
-    Some(home.join(".claude/projects"))
-}
-
 /// Finds all `.jsonl` session log files modified after a given time.
 pub(crate) fn recent_session_logs(
     projects_root: &Path,

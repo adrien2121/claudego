@@ -1,4 +1,5 @@
 use crate::cli::{select_runner, CommandSpec, RunnerKind};
+use crate::harness::{MonitorSpec, ParseOutcome, SessionRoot, TranscriptParser};
 use crate::logging;
 use crate::models::{AppState, ChildOutcome};
 use crate::monitor;
@@ -8,6 +9,8 @@ use crate::resume::StreamResumeCommand;
 use crate::stream_json;
 use crate::terminal::RawModeGuard;
 use anyhow::Result;
+use chrono::{DateTime, Local};
+use std::path::PathBuf;
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -19,6 +22,29 @@ enum ReaderDrain {
     Completed,
     JoinFailed(tokio::task::JoinError),
     TimedOut,
+}
+
+struct LegacySessionRoot;
+
+impl SessionRoot for LegacySessionRoot {
+    fn resolve(&self) -> Option<PathBuf> {
+        dirs::home_dir().map(|home| home.join(".claude/projects"))
+    }
+}
+
+struct LegacyTranscriptParser;
+
+impl TranscriptParser for LegacyTranscriptParser {
+    fn parse_line(&self, line: &str, now: DateTime<Local>) -> ParseOutcome {
+        crate::watcher::scan::TranscriptLineParser.parse_line(line, now)
+    }
+}
+
+fn legacy_monitor_spec() -> MonitorSpec {
+    MonitorSpec {
+        root: Arc::new(LegacySessionRoot),
+        parser: Arc::new(LegacyTranscriptParser),
+    }
 }
 
 async fn drain_reader(handle: tokio::task::JoinHandle<()>, timeout: Duration) -> ReaderDrain {
@@ -39,7 +65,11 @@ async fn run_pty_interactive(
     let reader_handle = pty_bridge::spawn_output_reader(session.reader, Arc::clone(&state));
     pty_bridge::spawn_input_writer(Arc::clone(&session.writer));
     pty_bridge::spawn_resize_poller(session.master, session.initial_size);
-    monitor::spawn_lockout_monitor(state, ResumeTarget::Pty(Arc::clone(&session.writer)));
+    monitor::spawn_lockout_monitor(
+        state,
+        legacy_monitor_spec(),
+        Arc::new(ResumeTarget::Pty(Arc::clone(&session.writer))),
+    );
 
     let child_wait_handle = tokio::task::spawn_blocking(move || session.child.wait());
     let status = child_wait_handle.await??;
@@ -86,7 +116,11 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutc
         RunnerKind::PtyInteractive => run_pty_interactive(command_spec, state).await,
         RunnerKind::StreamJsonPrint => {
             let (resume_tx, resume_rx) = mpsc::unbounded_channel::<StreamResumeCommand>();
-            monitor::spawn_lockout_monitor(state.clone(), ResumeTarget::StreamJson(resume_tx));
+            monitor::spawn_lockout_monitor(
+                state.clone(),
+                legacy_monitor_spec(),
+                Arc::new(ResumeTarget::StreamJson(resume_tx)),
+            );
             stream_json::run_stream_json_print(command_spec, state, resume_rx).await
         }
     };

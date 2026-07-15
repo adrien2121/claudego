@@ -1,9 +1,11 @@
+use crate::harness::{MonitorSpec, ResumeSink, TranscriptParser};
 use crate::logging::log_to_file;
 use crate::models::SharedAppState;
-use crate::resume::ResumeTarget;
 use crate::time_format::format_duration;
 use chrono::Local;
 use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{sleep, Duration};
 
@@ -26,14 +28,20 @@ enum MonitorControl {
     Stop,
 }
 
-/// Spawns a dedicated thread to monitor Claude log files for rate limit lockouts.
-pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget) {
+/// Spawns a dedicated task to monitor transcript files for rate-limit lockouts.
+pub fn spawn_lockout_monitor(
+    state: SharedAppState,
+    monitor: MonitorSpec,
+    resume_sink: Arc<dyn ResumeSink>,
+) {
     tokio::spawn(async move {
         // ── 1. Initial full scan (I/O outside lock) ───────────────────
-        startup::initial_scan(&state);
+        let Some(root) = startup::initial_scan(&state, &monitor) else {
+            return;
+        };
 
         // ── 2. Create OS file watcher ───────────────────────────────────
-        let Some(mut handle) = lifecycle::create_watcher().await else {
+        let Some(mut handle) = lifecycle::create_watcher(&root).await else {
             return;
         };
         log_to_file("[System] Event-driven file watcher active. Blocking until events arrive.");
@@ -62,6 +70,8 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                             &state,
                             &mut next_log_time,
                             &mut scan_failure_logs,
+                            &root,
+                            monitor.parser.as_ref(),
                         )
                         .await
                             == MonitorControl::Stop
@@ -70,7 +80,7 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                         }
                         continue;
                     }
-                    runtime::handle_expiry(&state, &resume_target, target).await;
+                    runtime::handle_expiry(&state, resume_sink.as_ref(), target).await;
                     continue; // Re-evaluate state immediately
                 }
 
@@ -98,7 +108,7 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                         // Timer expired, loop will check if lockout is over or log progress.
                     }
                     event_res = handle.rx.recv() => {
-                        if handle_event_result(event_res, &mut handle, &state, &mut next_log_time, &mut scan_failure_logs).await
+                        if handle_event_result(event_res, &mut handle, &state, &mut next_log_time, &mut scan_failure_logs, &root, monitor.parser.as_ref()).await
                             == MonitorControl::Stop
                         {
                             return;
@@ -114,6 +124,8 @@ pub fn spawn_lockout_monitor(state: SharedAppState, resume_target: ResumeTarget)
                     &state,
                     &mut next_log_time,
                     &mut scan_failure_logs,
+                    &root,
+                    monitor.parser.as_ref(),
                 )
                 .await
                     == MonitorControl::Stop
@@ -131,13 +143,21 @@ async fn handle_event_result(
     state: &SharedAppState,
     next_log_time: &mut Instant,
     scan_failure_logs: &mut HashMap<std::path::PathBuf, Instant>,
+    root: &Path,
+    parser: &dyn TranscriptParser,
 ) -> MonitorControl {
     match event_res {
         Some(Ok(first_event)) => {
             let paths = events::debounce_events(first_event, &mut handle.rx).await;
             if !paths.is_empty() {
-                runtime::scan_and_update_state(paths, state, next_log_time, scan_failure_logs)
-                    .await;
+                runtime::scan_and_update_state(
+                    paths,
+                    state,
+                    next_log_time,
+                    scan_failure_logs,
+                    parser,
+                )
+                .await;
             }
         }
         Some(Err(_)) => { /* A notify error occurred, but the channel is fine. Continue. */ }
@@ -145,7 +165,7 @@ async fn handle_event_result(
             // The watcher channel disconnected. Attempt to recover.
             log_to_file("[Watcher] Disconnected. Attempting recovery…");
             return recovery_control(async {
-                let new_handle = lifecycle::create_watcher().await?;
+                let new_handle = lifecycle::create_watcher(root).await?;
                 *handle = new_handle;
                 Some(())
             })

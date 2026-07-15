@@ -1,6 +1,7 @@
 use super::helpers::WATCHER_MAX_RETRIES;
 use crate::logging::log_to_file;
 use notify::{Event, RecommendedWatcher, RecursiveMode, Result, Watcher};
+use std::path::Path;
 use tokio::sync::mpsc::{self, Receiver};
 use tokio::time::{sleep, Duration};
 
@@ -10,11 +11,12 @@ pub(super) struct WatcherHandle {
     pub(super) rx: Receiver<Result<Event>>,
 }
 
-/// Create a recursive file watcher on `~/.claude/projects`, retrying with
-/// exponential backoff (1 s, 2 s, 4 s) on transient failures.
-pub(super) async fn create_watcher() -> Option<WatcherHandle> {
-    let projects_root = crate::watcher::files::claude_projects_root()?;
-    let _ = std::fs::create_dir_all(&projects_root);
+/// Create a recursive file watcher, retrying with exponential backoff.
+pub(super) async fn create_watcher(root: &Path) -> Option<WatcherHandle> {
+    if std::fs::create_dir_all(root).is_err() {
+        log_to_file("[Watcher Error] Session root could not be prepared.");
+        return None;
+    }
 
     for attempt in 0..WATCHER_MAX_RETRIES {
         let (tx, rx) = mpsc::channel(32);
@@ -25,7 +27,7 @@ pub(super) async fn create_watcher() -> Option<WatcherHandle> {
             tx.blocking_send(res).ok();
         };
         match notify::recommended_watcher(event_handler) {
-            Ok(mut watcher) => match watcher.watch(&projects_root, RecursiveMode::Recursive) {
+            Ok(mut watcher) => match watcher.watch(root, RecursiveMode::Recursive) {
                 Ok(()) => {
                     if attempt > 0 {
                         log_to_file(&format!(

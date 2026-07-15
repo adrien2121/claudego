@@ -1,53 +1,75 @@
+use crate::harness::{LimitState, LimitUpdate, MonitorSpec, ParseOutcome, TranscriptParser};
 use crate::logging::log_to_file;
 use crate::models::SharedAppState;
 use crate::monitor::helpers::SCAN_CHUNK_SIZE;
 use crate::watcher::files as watcher_files;
-use crate::watcher::scan::{InitialScanResult, RateLimitInfo};
-use chrono::Local;
+use chrono::{DateTime, Local};
 use memchr;
 use std::fs::File;
 use std::io::{Read, Result as IoResult, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-fn select_newest(
-    current: Option<RateLimitInfo>,
-    candidate: RateLimitInfo,
-) -> Option<RateLimitInfo> {
+fn select_newest(current: Option<LimitUpdate>, candidate: LimitUpdate) -> Option<LimitUpdate> {
     match current {
         Some(current) if current.event_time >= candidate.event_time => Some(current),
         _ => Some(candidate),
     }
 }
 
-fn apply_startup_limit(state: &SharedAppState, limit: RateLimitInfo) {
-    let active = limit.target_time > Local::now();
-    if active {
-        log_to_file("  [MATCH] Active 'rate_limit' row found on startup scan.");
-        log_to_file(&format!(
-            "  [SUCCESS] Valid active limit confirmed! Resets: {}",
-            limit.display_str
-        ));
-        log_to_file(&format!(
-            "[LOCKOUT ON STARTUP] Rate limit found. Target: {}",
-            limit.display_str
-        ));
+fn apply_startup_limit(state: &SharedAppState, mut update: LimitUpdate) {
+    let expired = matches!(
+        &update.state,
+        LimitState::Locked { target_time, .. } if *target_time <= Local::now()
+    );
+    if expired {
+        update.state = LimitState::Clear;
     }
 
-    let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
-    app.latest_rate_limit_event_time = Some(limit.event_time);
-    app.lockout_target_time = active.then_some(limit.target_time);
+    if let LimitState::Locked { display, .. } = &update.state {
+        log_to_file("  [MATCH] Active rate-limit row found on startup scan.");
+        log_to_file(&format!(
+            "  [SUCCESS] Valid limit confirmed! Resets: {display}"
+        ));
+        log_to_file(&format!(
+            "[LOCKOUT ON STARTUP] Rate limit found. Target: {display}"
+        ));
+    }
+    crate::monitor::runtime::apply_limit_update(state, update, false);
+}
+
+pub(super) fn newest_update_in_content(
+    content: &str,
+    parser: &dyn TranscriptParser,
+    now: DateTime<Local>,
+) -> Option<LimitUpdate> {
+    content
+        .lines()
+        .rev()
+        .filter_map(|line| match parser.parse_line(line, now) {
+            ParseOutcome::Update(update) => Some(update),
+            ParseOutcome::Diagnostic(diagnostic) => {
+                log_to_file(&format!("[Parser] {}.", diagnostic.message()));
+                None
+            }
+            ParseOutcome::Ignored => None,
+        })
+        .max_by_key(|update| update.event_time)
 }
 
 /// Scans a single file by reading it backwards in chunks. This is memory-efficient
 /// and robustly finds the most recent rate-limit message by correctly handling
 /// log lines that are split across chunk boundaries.
-fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
+fn scan_file_backwards(
+    path: &PathBuf,
+    parser: &dyn TranscriptParser,
+    now: DateTime<Local>,
+) -> IoResult<Option<LimitUpdate>> {
     let mut file = File::open(path)?;
     let file_size = file.metadata()?.len();
 
     if file_size == 0 {
-        return Ok(InitialScanResult::NoLimitFound);
+        return Ok(None);
     }
 
     let mut buffer = Vec::with_capacity(SCAN_CHUNK_SIZE);
@@ -98,26 +120,40 @@ fn scan_file_backwards(path: &PathBuf) -> IoResult<InitialScanResult> {
             }
         }
 
-        // We must use `scan_content_for_any_limit` to correctly stop at the
-        // first (most recent) limit, even if it's stale.
-        match crate::watcher::scan::scan_content_for_any_limit(content_to_scan) {
-            InitialScanResult::Found(limit) => return Ok(InitialScanResult::Found(limit)),
-            InitialScanResult::NoLimitFound => { /* Continue to the previous chunk */ }
+        // Scanning backwards lets us stop after the newest chunk containing an update.
+        if let Some(update) = newest_update_in_content(content_to_scan, parser, now) {
+            return Ok(Some(update));
         }
 
         current_pos = read_start;
     }
 
-    Ok(InitialScanResult::NoLimitFound)
+    Ok(None)
 }
 
 /// Performs the initial scan of all session files on startup.
-pub(super) fn initial_scan(state: &SharedAppState) {
+pub(super) fn initial_scan(state: &SharedAppState, monitor: &MonitorSpec) -> Option<PathBuf> {
+    let Some(root) = monitor.root.resolve() else {
+        log_to_file("[Startup] Session root is unavailable; monitoring disabled.");
+        return None;
+    };
+    if std::fs::create_dir_all(&root).is_err() {
+        log_to_file("[Startup] Session root could not be prepared; monitoring disabled.");
+        return None;
+    }
+    initial_scan_from(state, &root, monitor.parser.as_ref());
+    Some(root)
+}
+
+pub(super) fn initial_scan_from(
+    state: &SharedAppState,
+    root: &Path,
+    parser: &dyn TranscriptParser,
+) {
     log_to_file("[Startup] Performing initial rate limit check…");
-    let initial_files = watcher_files::claude_projects_root()
-        .map(|root| watcher_files::recent_session_logs(&root, SystemTime::UNIX_EPOCH))
-        .unwrap_or_default();
-    let mut latest_limit: Option<RateLimitInfo> = None;
+    let initial_files = watcher_files::recent_session_logs(root, SystemTime::UNIX_EPOCH);
+    let mut latest_limit: Option<LimitUpdate> = None;
+    let now = Local::now();
 
     if !initial_files.is_empty() {
         log_to_file(&format!(
@@ -135,11 +171,11 @@ pub(super) fn initial_scan(state: &SharedAppState) {
             .file_size_cache
             .insert(path.clone(), file_size);
 
-        match scan_file_backwards(&path) {
-            Ok(InitialScanResult::Found(limit)) => {
+        match scan_file_backwards(&path, parser, now) {
+            Ok(Some(limit)) => {
                 latest_limit = select_newest(latest_limit, limit);
             }
-            Ok(InitialScanResult::NoLimitFound) => {
+            Ok(None) => {
                 // No limit found in the entire file.
             }
             Err(e) => {
@@ -162,26 +198,100 @@ pub(super) fn initial_scan(state: &SharedAppState) {
 #[cfg(test)]
 mod tests {
     #[allow(unused_imports)]
-    use super::{apply_startup_limit, select_newest};
+    use super::{apply_startup_limit, initial_scan_from, select_newest};
+    use crate::harness::{LimitState, LimitUpdate, ParseOutcome, TranscriptParser};
     #[allow(unused_imports)]
     use crate::models::AppState;
-    use crate::watcher::scan::RateLimitInfo;
     #[allow(unused_imports)]
-    use chrono::{Datelike, Local, TimeZone, Timelike};
+    use chrono::{DateTime, Datelike, Local, TimeZone, Timelike};
+    use std::path::{Path, PathBuf};
     #[allow(unused_imports)]
     use std::sync::{Arc, Mutex};
+    use std::time::SystemTime;
+
+    #[derive(Clone)]
+    struct FixedParser {
+        update: LimitUpdate,
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "botsitter-monitor-startup-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    impl TranscriptParser for FixedParser {
+        fn parse_line(&self, line: &str, _now: DateTime<Local>) -> ParseOutcome {
+            if line == "limit" {
+                ParseOutcome::Update(self.update.clone())
+            } else {
+                ParseOutcome::Ignored
+            }
+        }
+    }
+
+    #[test]
+    fn injected_parser_controls_startup_state() {
+        let root = TestDir::new();
+        std::fs::write(root.path().join("session.jsonl"), "ignored\nlimit\n").unwrap();
+        let event_time = Local::now();
+        let target_time = event_time + chrono::Duration::hours(1);
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let parser = FixedParser {
+            update: LimitUpdate {
+                event_time,
+                state: LimitState::Locked {
+                    target_time,
+                    display: "fixture".into(),
+                },
+            },
+        };
+
+        initial_scan_from(&state, root.path(), &parser);
+
+        assert_eq!(state.lock().unwrap().lockout_target_time, Some(target_time));
+    }
 
     #[allow(dead_code)]
-    fn limit(event_hour: u32, target_day: u32, target_hour: u32) -> RateLimitInfo {
-        RateLimitInfo {
+    fn limit(event_hour: u32, target_day: u32, target_hour: u32) -> LimitUpdate {
+        LimitUpdate {
             event_time: Local
                 .with_ymd_and_hms(2026, 7, 12, event_hour, 0, 0)
                 .unwrap(),
-            target_time: Local
-                .with_ymd_and_hms(2026, 7, target_day, target_hour, 0, 5)
-                .unwrap(),
-            display_str: "fixture".to_string(),
-            raw_message: "fixture".to_string(),
+            state: LimitState::Locked {
+                target_time: Local
+                    .with_ymd_and_hms(2026, 7, target_day, target_hour, 0, 5)
+                    .unwrap(),
+                display: "fixture".to_string(),
+            },
+        }
+    }
+
+    fn target(update: &LimitUpdate) -> DateTime<Local> {
+        match update.state {
+            LimitState::Locked { target_time, .. } => target_time,
+            LimitState::Clear => panic!("expected locked update"),
         }
     }
 
@@ -191,17 +301,20 @@ mod tests {
         let newer_session = limit(23, 13, 0);
         let selected = select_newest(select_newest(None, older_weekly), newer_session).unwrap();
         assert_eq!(selected.event_time.hour(), 23);
-        assert_eq!(selected.target_time.day(), 13);
+        assert_eq!(target(&selected).day(), 13);
     }
 
     #[test]
     fn newer_expired_event_suppresses_older_active_event() {
         let older_active = limit(20, 14, 10);
         let mut newer_expired = limit(23, 13, 0);
-        newer_expired.target_time = Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 5).unwrap();
+        newer_expired.state = LimitState::Locked {
+            target_time: Local.with_ymd_and_hms(2026, 7, 12, 23, 0, 5).unwrap(),
+            display: "expired".into(),
+        };
         let selected = select_newest(select_newest(None, older_active), newer_expired).unwrap();
         assert_eq!(selected.event_time.hour(), 23);
-        assert_eq!(selected.target_time.day(), 12);
+        assert_eq!(target(&selected).day(), 12);
     }
 
     #[test]
@@ -210,7 +323,7 @@ mod tests {
         let newer_overnight = limit(23, 13, 2);
         let selected = select_newest(select_newest(None, older_weekly), newer_overnight).unwrap();
         assert_eq!(
-            selected.target_time,
+            target(&selected),
             Local.with_ymd_and_hms(2026, 7, 13, 2, 0, 5).unwrap()
         );
     }
@@ -221,11 +334,12 @@ mod tests {
         let event_time = Local::now() - chrono::Duration::hours(2);
         apply_startup_limit(
             &state,
-            RateLimitInfo {
+            LimitUpdate {
                 event_time,
-                target_time: Local::now() - chrono::Duration::hours(1),
-                display_str: "expired".to_string(),
-                raw_message: "expired".to_string(),
+                state: LimitState::Locked {
+                    target_time: Local::now() - chrono::Duration::hours(1),
+                    display: "expired".to_string(),
+                },
             },
         );
         let app = state.lock().unwrap();

@@ -1,8 +1,7 @@
-use crate::harness::{LimitState, LimitUpdate};
+use crate::harness::{LimitState, LimitUpdate, ResumeOutcome, ResumeSink, TranscriptParser};
 use crate::logging::log_to_file;
 use crate::models::{output_is_hot, SharedAppState};
 use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
-use crate::resume::{ResumeOutcome, ResumeTarget};
 use chrono::{DateTime, Local};
 use memmap2;
 use std::collections::{HashMap, HashSet};
@@ -27,7 +26,7 @@ trait ResumeAttempt {
 
 struct StableScan {
     new_size: u64,
-    limit: Option<crate::watcher::scan::RateLimitInfo>,
+    update: Option<LimitUpdate>,
 }
 
 #[derive(Debug)]
@@ -55,7 +54,8 @@ fn scan_mmap_range(
     file: &File,
     old_size: u64,
     new_size: u64,
-) -> Result<Option<crate::watcher::scan::RateLimitInfo>, ScanFailure> {
+    parser: &dyn TranscriptParser,
+) -> Result<Option<LimitUpdate>, ScanFailure> {
     // Safety: the file is opened read-only and the captured range is bounds-checked
     // before slicing, so concurrent truncation is reported instead of panicking.
     let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(ScanFailure::Mmap)?;
@@ -69,20 +69,25 @@ fn scan_mmap_range(
     }
     let scan_slice = &mmap[scan_start..new_size];
     let scan_str = std::str::from_utf8(scan_slice).map_err(|_| ScanFailure::InvalidUtf8)?;
-    Ok(crate::watcher::scan::scan_content_for_limit(scan_str))
+    Ok(super::startup::newest_update_in_content(
+        scan_str,
+        parser,
+        Local::now(),
+    ))
 }
 
 fn scan_stable_range_with(
     path: &Path,
     old_size: u64,
+    parser: &dyn TranscriptParser,
     after_scan: impl FnOnce(),
 ) -> Result<StableScan, ScanFailure> {
     let file = File::open(path).map_err(ScanFailure::Open)?;
     let before = file.metadata().map_err(ScanFailure::Metadata)?;
     let new_size = before.len();
     let modified = before.modified().map_err(ScanFailure::Metadata)?;
-    let limit = if new_size > old_size {
-        scan_mmap_range(&file, old_size, new_size)?
+    let update = if new_size > old_size {
+        scan_mmap_range(&file, old_size, new_size, parser)?
     } else {
         None
     };
@@ -91,14 +96,22 @@ fn scan_stable_range_with(
     if after.len() != new_size || after.modified().map_err(ScanFailure::Metadata)? != modified {
         return Err(ScanFailure::Changed);
     }
-    Ok(StableScan { new_size, limit })
+    Ok(StableScan { new_size, update })
 }
 
-fn scan_stable_range(path: &Path, old_size: u64) -> Result<StableScan, ScanFailure> {
-    scan_stable_range_with(path, old_size, || {})
+fn scan_stable_range(
+    path: &Path,
+    old_size: u64,
+    parser: &dyn TranscriptParser,
+) -> Result<StableScan, ScanFailure> {
+    scan_stable_range_with(path, old_size, parser, || {})
 }
 
-fn scan_one_path(path: &Path, state: &SharedAppState) -> Result<StableScan, ScanFailure> {
+fn scan_one_path(
+    path: &Path,
+    state: &SharedAppState,
+    parser: &dyn TranscriptParser,
+) -> Result<StableScan, ScanFailure> {
     let old_size = state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -106,7 +119,7 @@ fn scan_one_path(path: &Path, state: &SharedAppState) -> Result<StableScan, Scan
         .get(path)
         .copied()
         .unwrap_or(0);
-    let scan = scan_stable_range(path, old_size)?;
+    let scan = scan_stable_range(path, old_size, parser)?;
     state
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -116,13 +129,18 @@ fn scan_one_path(path: &Path, state: &SharedAppState) -> Result<StableScan, Scan
 }
 
 #[cfg(test)]
-fn scan_mmap_range_for_test(file: &File, old_size: u64, new_size: u64) -> Result<(), ScanFailure> {
-    scan_mmap_range(file, old_size, new_size).map(|_| ())
+fn scan_mmap_range_for_test(
+    file: &File,
+    old_size: u64,
+    new_size: u64,
+    parser: &dyn TranscriptParser,
+) -> Result<(), ScanFailure> {
+    scan_mmap_range(file, old_size, new_size, parser).map(|_| ())
 }
 
-impl ResumeAttempt for ResumeTarget {
+impl ResumeAttempt for &dyn ResumeSink {
     fn resume(&self) -> ResumeOutcome {
-        ResumeTarget::resume(self)
+        (*self).resume()
     }
 }
 
@@ -132,6 +150,7 @@ pub(super) async fn scan_and_update_state(
     state: &SharedAppState,
     next_log_time: &mut Instant,
     failure_logs: &mut HashMap<PathBuf, Instant>,
+    parser: &dyn TranscriptParser,
 ) {
     // --- Busy-Wait Logic ---
     // Before scanning, check if the PTY is actively streaming. If so, wait.
@@ -144,7 +163,7 @@ pub(super) async fn scan_and_update_state(
     loop {
         if output_is_hot(&activity_tracker, PTY_BUSY_THRESHOLD) {
             log_to_file(&format!(
-                "Claude is currently streaming output. Deferring file scan for {:?}.",
+                "Child output is currently streaming. Deferring file scan for {:?}.",
                 DEFER_SCAN_INTERVAL,
             ));
             sleep(DEFER_SCAN_INTERVAL).await;
@@ -161,7 +180,7 @@ pub(super) async fn scan_and_update_state(
     ));
 
     for path in paths {
-        let StableScan { limit, .. } = match scan_one_path(&path, state) {
+        let StableScan { update, .. } = match scan_one_path(&path, state, parser) {
             Ok(scan) => {
                 failure_logs.remove(&path);
                 scan
@@ -178,16 +197,25 @@ pub(super) async fn scan_and_update_state(
                 continue;
             }
         };
-        if let Some(limit_info) = limit {
-            // These logs were previously inside `watcher::scan::parse_rate_limit_line`.
-            // Moving them here makes the parser a pure function.
-            log_to_file("  [MATCH] Active 'rate_limit' row found! Parsing contents...");
-            log_to_file(&format!(
-                "  [SUCCESS] Valid active limit confirmed! Resets: {}",
-                limit_info.display_str
-            ));
-            record_lockout(state, limit_info, "file watcher");
-            *next_log_time = Instant::now();
+        if let Some(update) = update {
+            let display = match &update.state {
+                LimitState::Locked { display, .. } => Some(display.clone()),
+                LimitState::Clear => None,
+            };
+            if apply_limit_update(state, update, true) {
+                if let Some(display) = display {
+                    log_to_file("  [MATCH] Active rate-limit row found! Parsing contents...");
+                    log_to_file(&format!(
+                        "  [SUCCESS] Valid active limit confirmed! Resets: {display}"
+                    ));
+                    log_to_file(&format!(
+                        "[LOCKOUT DETECTED] Rate limit hit from file watcher. Target: {display}"
+                    ));
+                } else {
+                    log_to_file("[LIMIT UPDATE] Transcript state cleared from file watcher.");
+                }
+                *next_log_time = Instant::now();
+            }
         }
     }
 }
@@ -242,10 +270,10 @@ pub(crate) fn apply_limit_update(
 /// Handles the logic for when a lockout expires.
 pub(super) async fn handle_expiry(
     state: &SharedAppState,
-    resume_target: &ResumeTarget,
+    resume_sink: &dyn ResumeSink,
     expired_target: DateTime<Local>,
 ) {
-    handle_expiry_with(state, expired_target, resume_target.clone()).await;
+    handle_expiry_with(state, expired_target, resume_sink).await;
 }
 
 async fn handle_expiry_with<R: ResumeAttempt>(
@@ -296,10 +324,10 @@ mod tests {
         apply_limit_update, handle_expiry_with, record_lockout, scan_and_update_state,
         scan_mmap_range_for_test, scan_one_path, ScanFailure,
     };
-    use crate::harness::{LimitState, LimitUpdate};
+    use crate::harness::{LimitState, LimitUpdate, ResumeOutcome};
     use crate::models::AppState;
-    use crate::resume::ResumeOutcome;
     use crate::watcher::scan::RateLimitInfo;
+    use crate::watcher::scan::TranscriptLineParser;
     use chrono::{Duration, Local};
     use std::collections::HashSet;
     use std::fs::OpenOptions;
@@ -307,6 +335,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    const PARSER: TranscriptLineParser = TranscriptLineParser;
 
     fn unique_path(name: &str) -> std::path::PathBuf {
         let unique = SystemTime::now()
@@ -329,7 +359,7 @@ mod tests {
     fn failed_scan_does_not_advance_cursor() {
         let path = unique_path("missing.jsonl");
         let state = state_with_cursor(path.clone(), 17);
-        let result = scan_one_path(&path, &state);
+        let result = scan_one_path(&path, &state, &PARSER);
         assert!(result.is_err());
         assert_eq!(state.lock().unwrap().file_size_cache[&path], 17);
     }
@@ -339,7 +369,7 @@ mod tests {
         let path = unique_path("truncated.jsonl");
         std::fs::write(&path, b"0123456789").unwrap();
         let file = std::fs::File::open(&path).unwrap();
-        let result = scan_mmap_range_for_test(&file, 0, 20);
+        let result = scan_mmap_range_for_test(&file, 0, 20, &PARSER);
         assert!(matches!(result, Err(ScanFailure::Changed)));
         std::fs::remove_file(path).unwrap();
     }
@@ -357,7 +387,7 @@ mod tests {
             now.to_rfc3339()
         );
 
-        let first = super::scan_stable_range_with(&path, old_size, || {
+        let first = super::scan_stable_range_with(&path, old_size, &PARSER, || {
             OpenOptions::new()
                 .append(true)
                 .open(&path)
@@ -368,8 +398,8 @@ mod tests {
         assert!(matches!(first, Err(ScanFailure::Changed)));
         assert_eq!(state.lock().unwrap().file_size_cache[&path], old_size);
 
-        let retry = scan_one_path(&path, &state).unwrap();
-        assert!(retry.limit.is_some());
+        let retry = scan_one_path(&path, &state, &PARSER).unwrap();
+        assert!(retry.update.is_some());
         assert_eq!(
             state.lock().unwrap().file_size_cache[&path],
             std::fs::metadata(&path).unwrap().len()
@@ -383,7 +413,7 @@ mod tests {
         std::fs::write(&path, b"0123456789").unwrap();
         let state = state_with_cursor(path.clone(), 4);
 
-        let first = super::scan_stable_range_with(&path, 4, || {
+        let first = super::scan_stable_range_with(&path, 4, &PARSER, || {
             OpenOptions::new()
                 .write(true)
                 .open(&path)
@@ -394,7 +424,7 @@ mod tests {
         assert!(matches!(first, Err(ScanFailure::Changed)));
         assert_eq!(state.lock().unwrap().file_size_cache[&path], 4);
 
-        scan_one_path(&path, &state).unwrap();
+        scan_one_path(&path, &state, &PARSER).unwrap();
         assert_eq!(state.lock().unwrap().file_size_cache[&path], 3);
         std::fs::remove_file(path).unwrap();
     }
@@ -603,6 +633,7 @@ mod tests {
             &state,
             &mut next_log_time,
             &mut std::collections::HashMap::new(),
+            &PARSER,
         )
         .await;
 
@@ -630,7 +661,7 @@ mod tests {
                 event_time: target,
                 target_time: target,
                 display_str: "5:30pm".to_string(),
-                raw_message: "Claude limit reached; resets 5:30pm".to_string(),
+                raw_message: "fixture".to_string(),
             },
             "stream-json",
         );
@@ -750,7 +781,7 @@ mod tests {
         std::fs::write(&path, content.as_bytes()).unwrap();
         let file = std::fs::File::open(&path).unwrap();
 
-        let result = scan_mmap_range_for_test(&file, 4097, content.len() as u64);
+        let result = scan_mmap_range_for_test(&file, 4097, content.len() as u64, &PARSER);
 
         assert!(result.is_ok());
         std::fs::remove_file(path).unwrap();
