@@ -1,5 +1,6 @@
 #![cfg(unix)]
 
+use chrono::Timelike;
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -86,7 +87,7 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     let claude = bin.join("claude");
     fs::write(
         &claude,
-        b"#!/bin/sh\nprintf '{\"type\":\"system\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}\\n'\n/bin/sleep 20\n",
+        b"#!/bin/sh\ncase \" $* \" in *\" --resume \"*) exit 0;; esac\nprintf '{\"type\":\"system\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}\\n'\n/bin/sleep 20\n",
     )
     .unwrap();
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
@@ -134,9 +135,16 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
 
     for _ in 0..10 {
         let mut file = OpenOptions::new().append(true).open(&session).unwrap();
+        let event_time = chrono::Local::now()
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap();
+        let reset = event_time.format("%-I:%M%P");
         writeln!(
             file,
-            "{{\"type\":\"private-test\",\"content\":\"{PRIVATE_MARKER}\"}}"
+            "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{PRIVATE_MARKER} Claude limit reached; resets {reset}\"}}]}}}}",
+            event_time.to_rfc3339(),
         )
         .unwrap();
         file.sync_all().unwrap();
@@ -148,6 +156,10 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
         }
     }
     wait_for_text(&live, "[File Event] Triggering scan. Changed files:");
+    wait_for_text(
+        &live,
+        "[LOCKOUT DETECTED] Rate limit hit from file watcher.",
+    );
 
     assert!(child.wait().unwrap().success());
     reader.join().unwrap();
@@ -156,4 +168,5 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     assert!(!persistent.contains(PRIVATE_MARKER));
     assert!(!live.contains(PRIVATE_MARKER));
     assert!(persistent.contains("[File Event] Triggering scan. Changed files:"));
+    assert!(persistent.contains("[LOCKOUT DETECTED] Rate limit hit from file watcher."));
 }

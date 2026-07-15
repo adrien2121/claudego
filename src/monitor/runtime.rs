@@ -1,3 +1,4 @@
+use crate::harness::{LimitState, LimitUpdate};
 use crate::logging::log_to_file;
 use crate::models::{output_is_hot, SharedAppState};
 use crate::monitor::helpers::{DEFER_SCAN_INTERVAL, PTY_BUSY_THRESHOLD};
@@ -182,10 +183,6 @@ pub(super) async fn scan_and_update_state(
             // Moving them here makes the parser a pure function.
             log_to_file("  [MATCH] Active 'rate_limit' row found! Parsing contents...");
             log_to_file(&format!(
-                "  [Extracted Text] Raw Limit Message: \"{}\"",
-                limit_info.raw_message
-            ));
-            log_to_file(&format!(
                 "  [SUCCESS] Valid active limit confirmed! Resets: {}",
                 limit_info.display_str
             ));
@@ -204,16 +201,42 @@ pub(super) fn record_lockout(
         "[LOCKOUT DETECTED] Rate limit hit from {source}. Target: {}",
         limit_info.display_str
     ));
+    apply_limit_update(
+        state,
+        LimitUpdate {
+            event_time: limit_info.event_time,
+            state: LimitState::Locked {
+                target_time: limit_info.target_time,
+                display: limit_info.display_str,
+            },
+        },
+        true,
+    );
+}
+
+pub(crate) fn apply_limit_update(
+    state: &SharedAppState,
+    update: LimitUpdate,
+    increment_revision: bool,
+) -> bool {
     let mut app = state.lock().unwrap_or_else(|e| e.into_inner());
     if app
         .latest_rate_limit_event_time
-        .is_some_and(|watermark| limit_info.event_time <= watermark)
+        .is_some_and(|watermark| watermark >= update.event_time)
     {
-        return;
+        return false;
     }
-    app.latest_rate_limit_event_time = Some(limit_info.event_time);
-    app.lockout_revision = app.lockout_revision.wrapping_add(1);
-    app.lockout_target_time = Some(limit_info.target_time);
+
+    app.latest_rate_limit_event_time = Some(update.event_time);
+    app.lockout_target_time = match update.state {
+        LimitState::Locked { target_time, .. } => Some(target_time),
+        LimitState::Clear => None,
+    };
+    app.resume_exhausted_revision = None;
+    if increment_revision {
+        app.lockout_revision = app.lockout_revision.wrapping_add(1);
+    }
+    true
 }
 
 /// Handles the logic for when a lockout expires.
@@ -270,9 +293,10 @@ async fn handle_expiry_with<R: ResumeAttempt>(
 #[cfg(test)]
 mod tests {
     use super::{
-        handle_expiry_with, record_lockout, scan_and_update_state, scan_mmap_range_for_test,
-        scan_one_path, ScanFailure,
+        apply_limit_update, handle_expiry_with, record_lockout, scan_and_update_state,
+        scan_mmap_range_for_test, scan_one_path, ScanFailure,
     };
+    use crate::harness::{LimitState, LimitUpdate};
     use crate::models::AppState;
     use crate::resume::ResumeOutcome;
     use crate::watcher::scan::RateLimitInfo;
@@ -653,6 +677,69 @@ mod tests {
         assert_eq!(app.lockout_target_time, Some(original_target));
         assert_eq!(app.lockout_revision, 7);
         assert_eq!(app.resume_exhausted_revision, Some(7));
+    }
+
+    #[test]
+    fn newer_clear_update_clears_lockout() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let event_time = Local::now();
+        let target_time = event_time + chrono::Duration::hours(1);
+
+        apply_limit_update(
+            &state,
+            LimitUpdate {
+                event_time,
+                state: LimitState::Locked {
+                    target_time,
+                    display: "fixture".into(),
+                },
+            },
+            true,
+        );
+        apply_limit_update(
+            &state,
+            LimitUpdate {
+                event_time: event_time + chrono::Duration::seconds(1),
+                state: LimitState::Clear,
+            },
+            true,
+        );
+
+        let app = state.lock().unwrap();
+        assert_eq!(app.lockout_target_time, None);
+        assert_eq!(
+            app.latest_rate_limit_event_time,
+            Some(event_time + chrono::Duration::seconds(1))
+        );
+    }
+
+    #[test]
+    fn stale_clear_update_cannot_replace_newer_lockout() {
+        let state = Arc::new(Mutex::new(AppState::new()));
+        let event_time = Local::now();
+        let target_time = event_time + chrono::Duration::hours(1);
+
+        apply_limit_update(
+            &state,
+            LimitUpdate {
+                event_time,
+                state: LimitState::Locked {
+                    target_time,
+                    display: "fixture".into(),
+                },
+            },
+            true,
+        );
+        apply_limit_update(
+            &state,
+            LimitUpdate {
+                event_time: event_time - chrono::Duration::seconds(1),
+                state: LimitState::Clear,
+            },
+            true,
+        );
+
+        assert_eq!(state.lock().unwrap().lockout_target_time, Some(target_time));
     }
 
     #[test]

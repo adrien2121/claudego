@@ -25,10 +25,6 @@ fn apply_startup_limit(state: &SharedAppState, limit: RateLimitInfo) {
     if active {
         log_to_file("  [MATCH] Active 'rate_limit' row found on startup scan.");
         log_to_file(&format!(
-            "  [Extracted Text] Raw Limit Message: \"{}\"",
-            limit.raw_message
-        ));
-        log_to_file(&format!(
             "  [SUCCESS] Valid active limit confirmed! Resets: {}",
             limit.display_str
         ));
