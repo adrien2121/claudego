@@ -721,7 +721,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claudego-stream-outcome-{}-{nonce}.sh",
+            "botsitter-stream-outcome-{}-{nonce}.sh",
             std::process::id()
         ));
         let ready_path = path.with_extension("ready");

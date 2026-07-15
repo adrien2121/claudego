@@ -13,8 +13,8 @@ impl LoggerPaths {
 
     pub fn for_pid_in(temp_dir: &Path, pid: u32) -> Self {
         Self {
-            log: temp_dir.join(format!("claudego-{pid}.log")),
-            port: temp_dir.join(format!("claudego-{pid}.port")),
+            log: temp_dir.join(format!("botsitter-{pid}.log")),
+            port: temp_dir.join(format!("botsitter-{pid}.port")),
         }
     }
 }
@@ -26,7 +26,7 @@ pub fn current_logger_paths() -> LoggerPaths {
 pub fn pid_from_port_path(path: &Path) -> Option<u32> {
     path.file_name()?
         .to_str()?
-        .strip_prefix("claudego-")?
+        .strip_prefix("botsitter-")?
         .strip_suffix(".port")?
         .parse()
         .ok()
@@ -40,15 +40,19 @@ mod tests {
     #[test]
     fn logger_paths_are_pid_scoped() {
         let paths = LoggerPaths::for_pid_in(Path::new("/tmp/test"), 42);
-        assert_eq!(paths.log, Path::new("/tmp/test/claudego-42.log"));
-        assert_eq!(paths.port, Path::new("/tmp/test/claudego-42.port"));
+        assert_eq!(paths.log, Path::new("/tmp/test/botsitter-42.log"));
+        assert_eq!(paths.port, Path::new("/tmp/test/botsitter-42.port"));
         assert_eq!(pid_from_port_path(&paths.port), Some(42));
         assert_eq!(
-            pid_from_port_path(Path::new("/tmp/test/claudego.port")),
+            pid_from_port_path(Path::new("/tmp/test/botsitter.port")),
             None
         );
         assert_eq!(
-            pid_from_port_path(Path::new("/tmp/test/claudego-x.port")),
+            pid_from_port_path(Path::new("/tmp/test/botsitter-x.port")),
+            None
+        );
+        assert_eq!(
+            pid_from_port_path(Path::new("/tmp/test/claudego-42.port")),
             None
         );
     }

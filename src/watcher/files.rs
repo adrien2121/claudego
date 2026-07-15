@@ -69,7 +69,7 @@ mod tests {
                 .unwrap()
                 .as_nanos();
             let path = std::env::temp_dir().join(format!(
-                "claudego-session-discovery-{}-{nonce}-{}",
+                "botsitter-session-discovery-{}-{nonce}-{}",
                 std::process::id(),
                 NEXT_TEST_DIR.fetch_add(1, Ordering::Relaxed),
             ));

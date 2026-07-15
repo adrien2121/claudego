@@ -22,20 +22,20 @@ fn final_pty_bytes_drain_before_shutdown() {
         let _ = reader.read_to_end(&mut output);
         let _ = output_tx.send(output);
     });
-    let tmp = std::env::temp_dir().join(format!("claudego-pty-exit-{}", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("botsitter-pty-exit-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create isolated temp directory");
-    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_claudego"));
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
     command.args(["--", "/bin/sh", "-c", "printf 'FINAL-PTY-BYTES\\n'; exit 7"]);
     command.env("TMPDIR", &tmp);
-    let mut child = pair.slave.spawn_command(command).expect("spawn claudego");
-    let wrapper_pid = child.process_id().expect("claudego PID");
-    let log_path = tmp.join(format!("claudego-{wrapper_pid}.log"));
-    let port_path = tmp.join(format!("claudego-{wrapper_pid}.port"));
+    let mut child = pair.slave.spawn_command(command).expect("spawn botsitter");
+    let wrapper_pid = child.process_id().expect("botsitter PID");
+    let log_path = tmp.join(format!("botsitter-{wrapper_pid}.log"));
+    let port_path = tmp.join(format!("botsitter-{wrapper_pid}.port"));
     drop(pair.slave);
     let deadline = Instant::now() + Duration::from_secs(5);
 
     loop {
-        if let Some(status) = child.try_wait().expect("poll claudego") {
+        if let Some(status) = child.try_wait().expect("poll botsitter") {
             assert_eq!(status.exit_code(), 7);
             let output = output_rx
                 .recv_timeout(Duration::from_secs(1))
@@ -61,7 +61,7 @@ fn final_pty_bytes_drain_before_shutdown() {
                 .recv_timeout(Duration::from_secs(1))
                 .unwrap_or_default();
             panic!(
-                "claudego did not exit after its PTY child exited; output: {}",
+                "botsitter did not exit after its PTY child exited; output: {}",
                 String::from_utf8_lossy(&output)
             );
         }

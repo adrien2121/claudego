@@ -111,7 +111,7 @@ impl Scratch {
     fn new(case: &str, run: usize) -> Result<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claudego-runtime-{case}-{}-{run}-{nonce}",
+            "botsitter-runtime-{case}-{}-{run}-{nonce}",
             process::id()
         ));
         fs::create_dir_all(&path)?;
@@ -212,7 +212,7 @@ async fn startup_scan(run: usize) -> Result<()> {
 
 async fn logger_fanout(run: usize) -> Result<()> {
     let scratch = Scratch::new("logger", run)?;
-    let log_path = scratch.0.join("claudego.log");
+    let log_path = scratch.0.join("botsitter.log");
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let healthy = TcpStream::connect(address).await?;

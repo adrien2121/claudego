@@ -290,7 +290,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!(
-            "claudego-runtime-{}-{unique}-{name}",
+            "botsitter-runtime-{}-{unique}-{name}",
             std::process::id()
         ))
     }
@@ -544,7 +544,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let dir = std::env::temp_dir().join(format!(
-            "claudego-direct-scan-{}-{unique}",
+            "botsitter-direct-scan-{}-{unique}",
             std::process::id()
         ));
         std::fs::create_dir(&dir).unwrap();

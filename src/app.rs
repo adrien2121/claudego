@@ -68,7 +68,7 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutc
 
     if show_logs {
         // Wait for the logger thread to signal that the TCP server is bound and ready.
-        // This prevents a race condition where claudego-logs starts before the port is known.
+        // This prevents a race condition where botsitter-logs starts before the port is known.
         // We use a blocking recv here because it's part of the initial setup, before the main async logic.
         if logger_ready_rx
             .recv_timeout(std::time::Duration::from_secs(5))
@@ -100,14 +100,14 @@ pub async fn run(show_logs: bool, command_spec: CommandSpec) -> Result<ChildOutc
 
 fn open_logs_terminal(pid: u32) {
     println!("[System] Live log streaming enabled.");
-    println!("[System] Launching claudego-logs in a new terminal...");
+    println!("[System] Launching botsitter-logs in a new terminal...");
 
-    // Find the absolute path to the claudego-logs binary (assumed to be in the same dir as claudego)
+    // Find the absolute path to the botsitter-logs binary (assumed to be in the same dir as botsitter)
     let logs_bin = std::env::current_exe()
         .ok()
-        .and_then(|p| p.parent().map(|dir| dir.join("claudego-logs")))
+        .and_then(|p| p.parent().map(|dir| dir.join("botsitter-logs")))
         .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "claudego-logs".to_string());
+        .unwrap_or_else(|| "botsitter-logs".to_string());
 
     #[cfg(target_os = "macos")]
     {
@@ -124,7 +124,7 @@ fn open_logs_terminal(pid: u32) {
     {
         let _ = std::process::Command::new("cmd")
             .arg("/c")
-            .arg(format!("start \"Claudego Logs\" \"{}\" {}", logs_bin, pid))
+            .arg(format!("start \"Botsitter Logs\" \"{}\" {}", logs_bin, pid))
             .spawn();
     }
     #[cfg(target_os = "linux")]

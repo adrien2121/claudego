@@ -14,7 +14,7 @@ impl TestDir {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claudego-logger-isolation-{}-{nonce}",
+            "botsitter-logger-isolation-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
@@ -80,7 +80,7 @@ fn concurrent_runs_keep_independent_logger_files() {
         pixel_height: 0,
     };
     let first_pair = NativePtySystem::default().openpty(size).unwrap();
-    let mut first_command = CommandBuilder::new(env!("CARGO_BIN_EXE_claudego"));
+    let mut first_command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
     first_command.args(["--", "/bin/sleep", "2"]);
     first_command.env("TMPDIR", &tmp);
     let mut first = first_pair.slave.spawn_command(first_command).unwrap();
@@ -89,7 +89,7 @@ fn concurrent_runs_keep_independent_logger_files() {
     let _first_master = first_pair.master;
 
     let second_pair = NativePtySystem::default().openpty(size).unwrap();
-    let mut second_command = CommandBuilder::new(env!("CARGO_BIN_EXE_claudego"));
+    let mut second_command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
     second_command.args(["--", "/bin/sleep", "10"]);
     second_command.env("TMPDIR", &tmp);
     let mut second = second_pair.slave.spawn_command(second_command).unwrap();
@@ -97,8 +97,8 @@ fn concurrent_runs_keep_independent_logger_files() {
     drop(second_pair.slave);
     let _second_master = second_pair.master;
 
-    let first_port = tmp.join(format!("claudego-{first_pid}.port"));
-    let second_port = tmp.join(format!("claudego-{second_pid}.port"));
+    let first_port = tmp.join(format!("botsitter-{first_pid}.port"));
+    let second_port = tmp.join(format!("botsitter-{second_pid}.port"));
     wait_for_reachable_port(&first_port);
     wait_for_reachable_port(&second_port);
     assert_ne!(first_port, second_port);
@@ -106,7 +106,7 @@ fn concurrent_runs_keep_independent_logger_files() {
     assert!(first.wait().unwrap().success());
     wait_for_absent(&first_port);
     assert!(port_is_reachable(&second_port));
-    assert!(tmp.join(format!("claudego-{second_pid}.log")).is_file());
+    assert!(tmp.join(format!("botsitter-{second_pid}.log")).is_file());
 
     let _ = second.kill();
     let _ = second.wait();

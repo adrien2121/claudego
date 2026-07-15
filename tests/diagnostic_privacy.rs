@@ -21,7 +21,7 @@ impl TestDir {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claudego-diagnostic-privacy-{}-{nonce}",
+            "botsitter-diagnostic-privacy-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
@@ -91,7 +91,7 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     .unwrap();
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_claudego"))
+    let mut child = Command::new(env!("CARGO_BIN_EXE_botsitter"))
         .args([
             "--",
             "claude",
@@ -108,8 +108,8 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
         .spawn()
         .unwrap();
     let pid = child.id();
-    let port_path = tmp.join(format!("claudego-{pid}.port"));
-    let log_path = tmp.join(format!("claudego-{pid}.log"));
+    let port_path = tmp.join(format!("botsitter-{pid}.port"));
+    let log_path = tmp.join(format!("botsitter-{pid}.log"));
     wait_for_file(&port_path);
     let port = fs::read_to_string(&port_path)
         .unwrap()

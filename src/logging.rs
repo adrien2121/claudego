@@ -335,7 +335,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claudego-slow-client-{}-{unique}.log",
+            "botsitter-slow-client-{}-{unique}.log",
             std::process::id()
         ));
         let (log_tx, log_rx) = mpsc::channel(1);

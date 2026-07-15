@@ -12,7 +12,7 @@ fn requested_pid() -> Result<Option<u32>> {
         .next()
         .map(|value| value.parse::<u32>().context("PID must be a decimal u32"))
         .transpose()?;
-    anyhow::ensure!(args.next().is_none(), "usage: claudego-logs [pid]");
+    anyhow::ensure!(args.next().is_none(), "usage: botsitter-logs [pid]");
     Ok(pid)
 }
 
@@ -23,12 +23,12 @@ fn candidate_port_files(pid: Option<u32>) -> Result<Vec<PathBuf>> {
 fn candidate_port_files_in(temp_dir: &Path, pid: Option<u32>) -> Result<Vec<PathBuf>> {
     if let Some(pid) = pid {
         return Ok(vec![
-            claudego::paths::LoggerPaths::for_pid_in(temp_dir, pid).port,
+            botsitter::paths::LoggerPaths::for_pid_in(temp_dir, pid).port,
         ]);
     }
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(temp_dir)?.flatten() {
-        if claudego::paths::pid_from_port_path(&entry.path()).is_none() {
+        if botsitter::paths::pid_from_port_path(&entry.path()).is_none() {
             continue;
         }
         let Ok(modified) = entry.metadata().and_then(|metadata| metadata.modified()) else {
@@ -57,14 +57,14 @@ fn try_connect_from_candidates(candidates: Vec<PathBuf>) -> Result<()> {
             Err(error) => last_error = Some(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no reachable claudego logger")))
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no reachable botsitter logger")))
 }
 
 fn stream_from_port_file(port_path: &Path) -> Result<()> {
     let port = std::fs::read_to_string(port_path)?.trim().parse::<u16>()?;
     let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
     let stream = TcpStream::connect_timeout(&address, Duration::from_secs(2))?;
-    println!("Connected. Streaming logs from claudego process...\n");
+    println!("Connected. Streaming logs from botsitter process...\n");
     let mut reader = BufReader::new(stream);
     let mut line = String::new();
     while reader.read_line(&mut line)? > 0 {
@@ -78,14 +78,14 @@ fn is_relevant_port_file_event(event: &notify::Event, pid: Option<u32>) -> bool 
     use notify::EventKind;
     matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_))
         && event.paths.iter().any(|path| match pid {
-            Some(pid) => path == &claudego::paths::LoggerPaths::for_pid(pid).port,
-            None => claudego::paths::pid_from_port_path(path).is_some(),
+            Some(pid) => path == &botsitter::paths::LoggerPaths::for_pid(pid).port,
+            None => botsitter::paths::pid_from_port_path(path).is_some(),
         })
 }
 
 fn main() -> Result<()> {
     let pid = requested_pid()?;
-    println!("Waiting for claudego session to start...");
+    println!("Waiting for botsitter session to start...");
     loop {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher: RecommendedWatcher =
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
             .context("Failed to start watching temp directory")?;
 
         if try_connect_and_stream(pid).is_ok() {
-            println!("\nConnection to claudego process lost. Waiting for it to restart...");
+            println!("\nConnection to botsitter process lost. Waiting for it to restart...");
             continue;
         }
 
@@ -103,7 +103,9 @@ fn main() -> Result<()> {
             if is_relevant_port_file_event(&event, pid) {
                 thread::sleep(Duration::from_millis(50));
                 if try_connect_and_stream(pid).is_ok() {
-                    println!("\nConnection to claudego process lost. Waiting for it to restart...");
+                    println!(
+                        "\nConnection to botsitter process lost. Waiting for it to restart..."
+                    );
                 }
                 break;
             }
@@ -126,7 +128,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let directory = std::env::temp_dir().join(format!(
-            "claudego-viewer-test-{}-{nonce}",
+            "botsitter-viewer-test-{}-{nonce}",
             std::process::id()
         ));
         fs::create_dir(&directory).unwrap();
@@ -135,8 +137,8 @@ mod tests {
         let dead_listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let dead_port = dead_listener.local_addr().unwrap().port();
         drop(dead_listener);
-        let older = directory.join("claudego-41.port");
-        let newer = directory.join("claudego-42.port");
+        let older = directory.join("botsitter-41.port");
+        let newer = directory.join("botsitter-42.port");
         fs::write(&older, live_port.to_string()).unwrap();
         fs::write(&newer, dead_port.to_string()).unwrap();
         File::options()
@@ -157,7 +159,7 @@ mod tests {
     #[test]
     fn event_filter_is_exact_for_requested_pid() {
         let event = notify::Event::new(notify::EventKind::Create(notify::event::CreateKind::File))
-            .add_path(claudego::paths::LoggerPaths::for_pid(41).port);
+            .add_path(botsitter::paths::LoggerPaths::for_pid(41).port);
         assert!(is_relevant_port_file_event(&event, Some(41)));
         assert!(!is_relevant_port_file_event(&event, Some(42)));
         assert!(is_relevant_port_file_event(&event, None));

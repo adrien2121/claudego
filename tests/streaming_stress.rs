@@ -20,7 +20,7 @@ impl TestDir {
             .expect("system clock before UNIX epoch")
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "claudego-streaming-stress-{}-{nanos}",
+            "botsitter-streaming-stress-{}-{nanos}",
             std::process::id()
         ));
         fs::create_dir(&path).expect("create isolated test directory");
@@ -96,7 +96,7 @@ fn wait_for_log_text(log: &Arc<Mutex<Vec<u8>>>, text: &str) {
 
 fn kill_and_reap(child: &mut Child) -> ExitStatus {
     let _ = child.kill();
-    child.wait().expect("reap claudego after kill")
+    child.wait().expect("reap botsitter after kill")
 }
 
 struct ChildGuard(Option<Child>);
@@ -138,7 +138,7 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
 
     let session = project.join("session.jsonl");
     fs::write(&session, b"{\"type\":\"baseline\"}\n").expect("seed session log");
-    let child = Command::new(env!("CARGO_BIN_EXE_claudego"))
+    let child = Command::new(env!("CARGO_BIN_EXE_botsitter"))
         .args([
             "--",
             "claude",
@@ -153,10 +153,10 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("spawn real claudego binary");
+        .expect("spawn real botsitter binary");
     let wrapper_pid = child.id();
-    let log_path = tmp.join(format!("claudego-{wrapper_pid}.log"));
-    let port_path = tmp.join(format!("claudego-{wrapper_pid}.port"));
+    let log_path = tmp.join(format!("botsitter-{wrapper_pid}.log"));
+    let port_path = tmp.join(format!("botsitter-{wrapper_pid}.port"));
     let mut child = ChildGuard(Some(child));
 
     let mut stdout = child.child_mut().stdout.take().expect("capture stdout");
@@ -237,7 +237,7 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         let log = live_log.lock().expect("lock live log").clone();
-        let wrapper_status = child.child_mut().try_wait().expect("poll claudego");
+        let wrapper_status = child.child_mut().try_wait().expect("poll botsitter");
         if log
             .windows(lockout.len())
             .filter(|window| *window == lockout.as_bytes())
@@ -245,7 +245,7 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
             == 1
             && String::from_utf8_lossy(&log).contains(child_exited)
         {
-            assert!(wrapper_status.is_none(), "claudego exited instead of awaiting Continue; status={wrapper_status:?}; stderr:\n{}\nlive log:\n{}", String::from_utf8_lossy(&stderr.lock().expect("lock stderr")), String::from_utf8_lossy(&log));
+            assert!(wrapper_status.is_none(), "botsitter exited instead of awaiting Continue; status={wrapper_status:?}; stderr:\n{}\nlive log:\n{}", String::from_utf8_lossy(&stderr.lock().expect("lock stderr")), String::from_utf8_lossy(&log));
             break;
         }
         if Instant::now() >= deadline {

@@ -1,7 +1,7 @@
 use anyhow::Result;
+use botsitter::app;
+use botsitter::cli::CommandSpec;
 use clap::Parser;
-use claudego::app;
-use claudego::cli::CommandSpec;
 use keepawake::Builder;
 
 /// A fire-and-forget wrapper for the claude CLI that automatically handles rate limits.
@@ -12,7 +12,7 @@ use keepawake::Builder;
     author = "Adrien Adam"
 )]
 struct Cli {
-    /// Prevent the system from sleeping while claudego is running.
+    /// Prevent the system from sleeping while botsitter is running.
     #[arg(long, short = 'p')]
     prevent_sleep: bool,
 

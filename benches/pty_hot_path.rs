@@ -1,8 +1,8 @@
-//! Measures `claudego`'s interactive PTY hot path on the current macOS host.
+//! Measures `botsitter`'s interactive PTY hot path on the current macOS host.
 //!
 //! Run with `cargo bench --bench pty_hot_path`. The benchmark reports three
-//! runs each for a direct flood-child control, `claudego` with an idle monitor,
-//! and `claudego` while active output defers a watcher scan. Every run validates
+//! runs each for a direct flood-child control, `botsitter` with an idle monitor,
+//! and `botsitter` while active output defers a watcher scan. Every run validates
 //! the deterministic byte stream before accepting its performance results.
 
 use portable_pty::{Child, CommandBuilder, ExitStatus, NativePtySystem, PtySize, PtySystem};
@@ -76,7 +76,7 @@ impl ScratchDir {
     fn new() -> BenchResult<Self> {
         let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
         let path =
-            std::env::temp_dir().join(format!("claudego-pty-hot-path-{}-{nonce}", process::id()));
+            std::env::temp_dir().join(format!("botsitter-pty-hot-path-{}-{nonce}", process::id()));
         fs::create_dir(&path)?;
         Ok(Self { path })
     }
@@ -96,8 +96,8 @@ struct LoggerPaths {
 
 fn logger_paths(run_dir: &Path, pid: u32) -> LoggerPaths {
     let tmp_dir = run_dir.join("tmp");
-    let log = tmp_dir.join(format!("claudego-{pid}.log"));
-    let port = tmp_dir.join(format!("claudego-{pid}.port"));
+    let log = tmp_dir.join(format!("botsitter-{pid}.log"));
+    let port = tmp_dir.join(format!("botsitter-{pid}.port"));
     LoggerPaths { tmp_dir, log, port }
 }
 
@@ -126,15 +126,15 @@ fn run() -> BenchResult<()> {
     }
 
     helper_self_check()?;
-    ensure_no_active_claudego()?;
+    ensure_no_active_botsitter()?;
 
     let scratch = ScratchDir::new()?;
     let benchmark_exe = std::env::current_exe()?;
-    let claudego_exe = PathBuf::from(env!("CARGO_BIN_EXE_claudego"));
+    let botsitter_exe = PathBuf::from(env!("CARGO_BIN_EXE_botsitter"));
     let mut all_results = Vec::new();
 
     println!(
-        "Running {RUNS_PER_SCENARIO} serial runs per scenario; do not run another claudego process."
+        "Running {RUNS_PER_SCENARIO} serial runs per scenario; do not run another botsitter process."
     );
 
     for scenario in Scenario::ALL {
@@ -144,14 +144,13 @@ fn run() -> BenchResult<()> {
                 .path
                 .join(format!("{}-{run_number}", scenario.label()));
             fs::create_dir(&run_dir)?;
-            let metrics = run_scenario(scenario, &claudego_exe, &benchmark_exe, &run_dir).map_err(
-                |error| {
+            let metrics = run_scenario(scenario, &botsitter_exe, &benchmark_exe, &run_dir)
+                .map_err(|error| {
                     failure(format!(
                         "{} run {run_number} failed: {error}",
                         scenario.label()
                     ))
-                },
-            )?;
+                })?;
             print_run(scenario, run_number, &metrics);
             runs.push(metrics);
         }
@@ -238,7 +237,7 @@ fn payload_pattern() -> Vec<u8> {
 
 fn run_scenario(
     scenario: Scenario,
-    claudego_exe: &Path,
+    botsitter_exe: &Path,
     benchmark_exe: &Path,
     run_dir: &Path,
 ) -> BenchResult<RunMetrics> {
@@ -267,7 +266,7 @@ fn run_scenario(
         ]);
         command
     } else {
-        let mut command = CommandBuilder::new(claudego_exe);
+        let mut command = CommandBuilder::new(botsitter_exe);
         command.args([
             "--",
             benchmark_exe
@@ -288,7 +287,7 @@ fn run_scenario(
     };
 
     let pty_system = NativePtySystem::default();
-    // The outer PTY makes claudego face a terminal without measuring terminal rendering.
+    // The outer PTY makes botsitter face a terminal without measuring terminal rendering.
     let pair = pty_system.openpty(PtySize {
         rows: 24,
         cols: 80,
@@ -364,7 +363,7 @@ fn finish_scenario(
     if scenario.uses_monitor() {
         let logs = fs::read_to_string(&logger_paths.log).map_err(|error| {
             failure(format!(
-                "read claudego log {}: {error}",
+                "read botsitter log {}: {error}",
                 logger_paths.log.display()
             ))
         })?;
@@ -540,7 +539,7 @@ fn verify_expected_count(count_path: &Path, verified_bytes: u64) -> BenchResult<
     Ok(())
 }
 
-fn ensure_no_active_claudego() -> BenchResult<()> {
+fn ensure_no_active_botsitter() -> BenchResult<()> {
     let entries = fs::read_dir(std::env::temp_dir())?;
     for entry in entries.flatten() {
         let path = entry.path();
@@ -548,7 +547,7 @@ fn ensure_no_active_claudego() -> BenchResult<()> {
             continue;
         };
         let Some(pid) = name
-            .strip_prefix("claudego-")
+            .strip_prefix("botsitter-")
             .and_then(|name| name.strip_suffix(".port"))
             .and_then(|pid| pid.parse::<u32>().ok())
         else {
@@ -558,12 +557,12 @@ fn ensure_no_active_claudego() -> BenchResult<()> {
             TcpStream::connect_timeout(&address, Duration::from_millis(100)).is_ok()
         }) {
             return Err(failure(format!(
-                "claudego logger PID {pid} is active; stop it before benchmarking"
+                "botsitter logger PID {pid} is active; stop it before benchmarking"
             )));
         }
     }
-    let _ = fs::remove_file(std::env::temp_dir().join("claudego.log"));
-    let _ = fs::remove_file(std::env::temp_dir().join("claudego.port"));
+    let _ = fs::remove_file(std::env::temp_dir().join("botsitter.log"));
+    let _ = fs::remove_file(std::env::temp_dir().join("botsitter.port"));
     Ok(())
 }
 
