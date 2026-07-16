@@ -40,18 +40,16 @@ pub(super) async fn create_watcher(root: &Path) -> Option<WatcherHandle> {
                         rx,
                     });
                 }
-                Err(e) => log_to_file(&format!(
-                    "[Watcher Error] watch() failed (attempt {}/{}): {}",
+                Err(_) => log_to_file(&format!(
+                    "[Watcher Error] Session watch failed (attempt {}/{}).",
                     attempt + 1,
-                    WATCHER_MAX_RETRIES,
-                    e
+                    WATCHER_MAX_RETRIES
                 )),
             },
-            Err(e) => log_to_file(&format!(
-                "[Watcher Error] recommended_watcher() failed (attempt {}/{}): {}",
+            Err(_) => log_to_file(&format!(
+                "[Watcher Error] Watcher initialization failed (attempt {}/{}).",
                 attempt + 1,
-                WATCHER_MAX_RETRIES,
-                e
+                WATCHER_MAX_RETRIES
             )),
         }
 

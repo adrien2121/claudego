@@ -178,12 +178,8 @@ pub(super) fn initial_scan_from(
             Ok(None) => {
                 // No limit found in the entire file.
             }
-            Err(e) => {
-                log_to_file(&format!(
-                    "[Startup] Error scanning file {}: {}",
-                    path.display(),
-                    e
-                ));
+            Err(_) => {
+                log_to_file("[Startup] Transcript scan failed.");
             }
         }
     }

@@ -1,17 +1,18 @@
 #![cfg(unix)]
 
 use chrono::{Duration as ChronoDuration, Timelike};
+use portable_pty::{CommandBuilder, NativePtySystem, PtySize, PtySystem};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const PRIVATE_MARKER: &str = "PRIVATE-SESSION-CONTENT-7b61f1e9";
+const PRIVATE_PATH_MARKER: &str = "PRIVATE-PATH-4db272ce";
 
 struct TestDir(PathBuf);
 
@@ -75,41 +76,55 @@ fn wait_for_text(log: &Arc<Mutex<Vec<u8>>>, text: &str) {
 #[test]
 fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     let root = TestDir::new();
-    let home = root.0.join("home");
+    let home = root.0.join(format!("home-{PRIVATE_PATH_MARKER}"));
     let project = home.join(".claude/projects/test");
     let tmp = root.0.join("tmp");
     let bin = root.0.join("bin");
+    let done = root.0.join("done");
     fs::create_dir_all(&project).unwrap();
     fs::create_dir(&tmp).unwrap();
     fs::create_dir(&bin).unwrap();
-    let session = project.join("session.jsonl");
+    let session = project.join(format!("session-{PRIVATE_PATH_MARKER}.jsonl"));
     fs::write(&session, b"{\"type\":\"baseline\"}\n").unwrap();
     let claude = bin.join("claude");
     fs::write(
         &claude,
-        b"#!/bin/sh\ncase \" $* \" in *\" --resume \"*) exit 0;; esac\nprintf '{\"type\":\"system\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}\\n'\n/bin/sleep 20\n",
+        b"#!/bin/sh\ncase \" $* \" in *\" --resume \"*) exit 0;; esac\nprintf '{\"type\":\"system\",\"session_id\":\"11111111-1111-1111-1111-111111111111\"}\\n'\ni=0\nwhile [ ! -f \"$BOTSITTER_PRIVACY_DONE\" ] && [ \"$i\" -lt 200 ]; do /bin/sleep 0.05; i=$((i + 1)); done\ntest -f \"$BOTSITTER_PRIVACY_DONE\"\n",
     )
     .unwrap();
     fs::set_permissions(&claude, fs::Permissions::from_mode(0o755)).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_botsitter"))
-        .args([
-            "claude",
-            "--",
-            "claude",
-            "-p",
-            "--output-format",
-            "stream-json",
-            "privacy-test",
-        ])
-        .env("HOME", &home)
-        .env("TMPDIR", &tmp)
-        .env("PATH", &bin)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
+    let pair = NativePtySystem::default()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
         .unwrap();
-    let pid = child.id();
+    let mut outer_reader = pair.master.try_clone_reader().unwrap();
+    let output_thread = thread::spawn(move || {
+        let mut output = Vec::new();
+        outer_reader.read_to_end(&mut output).unwrap();
+        output
+    });
+    let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
+    command.args([
+        "claude",
+        "--",
+        "claude",
+        "-p",
+        "--output-format",
+        "stream-json",
+        "privacy-test",
+    ]);
+    command.env("HOME", &home);
+    command.env("TMPDIR", &tmp);
+    command.env("PATH", &bin);
+    command.env("BOTSITTER_PRIVACY_DONE", &done);
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    let pid = child.process_id().unwrap();
+    drop(pair.slave);
     let port_path = tmp.join(format!("botsitter-{pid}.port"));
     let log_path = tmp.join(format!("botsitter-{pid}.log"));
     wait_for_file(&port_path);
@@ -134,14 +149,15 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
     wait_for_text(&live, "Event-driven file watcher active");
     thread::sleep(Duration::from_millis(250));
 
-    for _ in 0..10 {
+    {
         let mut file = OpenOptions::new().append(true).open(&session).unwrap();
         let event_time = chrono::Local::now()
             .with_second(0)
             .unwrap()
             .with_nanosecond(0)
-            .unwrap();
-        let reset = (event_time + ChronoDuration::minutes(1)).format("%-I:%M%P");
+            .unwrap()
+            - ChronoDuration::minutes(2);
+        let reset = (chrono::Local::now() + ChronoDuration::minutes(1)).format("%-I:%M%P");
         writeln!(
             file,
             "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{PRIVATE_MARKER} Claude limit reached; resets {reset}\"}}]}}}}",
@@ -149,35 +165,48 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
         )
         .unwrap();
         file.sync_all().unwrap();
-        thread::sleep(Duration::from_millis(250));
-        if String::from_utf8_lossy(&live.lock().unwrap())
-            .contains("[File Event] Triggering scan. Changed files:")
-        {
-            break;
-        }
     }
-    wait_for_text(&live, "[File Event] Triggering scan. Changed files:");
+    wait_for_text(&live, "[File Event] Triggering scan. Changed transcripts:");
     wait_for_text(
         &live,
         "[LOCKOUT DETECTED] Rate limit hit from file watcher.",
     );
 
-    for index in 0..128 {
-        fs::write(
-            project.join(format!("flush-{index:03}.jsonl")),
-            b"{\"type\":\"baseline\"}\n",
+    {
+        let mut file = OpenOptions::new().append(true).open(&session).unwrap();
+        let event_time = chrono::Local::now()
+            .with_second(0)
+            .unwrap()
+            .with_nanosecond(0)
+            .unwrap()
+            - ChronoDuration::minutes(1);
+        let reset = event_time.format("%b %-d at %-I:%M%P");
+        writeln!(
+            file,
+            "{{\"timestamp\":\"{}\",\"error\":\"rate_limit\",\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"{PRIVATE_MARKER} Claude limit reached; resets {reset}\"}}]}}}}",
+            event_time.to_rfc3339(),
         )
         .unwrap();
+        file.sync_all().unwrap();
     }
-    wait_for_text(&live, "flush-127.jsonl");
+    wait_for_text(
+        &live,
+        "[LIMIT UPDATE] Transcript state cleared from file watcher.",
+    );
 
-    child.kill().unwrap();
-    assert!(!child.wait().unwrap().success());
+    fs::write(&done, b"done").unwrap();
+    let status = child.wait().unwrap();
+    assert_eq!(status.exit_code(), 0);
+    drop(pair.master);
+    let output = output_thread.join().unwrap();
     reader.join().unwrap();
     let persistent = fs::read_to_string(log_path).unwrap();
     let live = String::from_utf8_lossy(&live.lock().unwrap()).into_owned();
-    assert!(!persistent.contains(PRIVATE_MARKER));
-    assert!(!live.contains(PRIVATE_MARKER));
-    assert!(persistent.contains("[File Event] Triggering scan. Changed files:"));
+    for private in [PRIVATE_MARKER, PRIVATE_PATH_MARKER] {
+        assert!(!persistent.contains(private));
+        assert!(!live.contains(private));
+        assert!(!String::from_utf8_lossy(&output).contains(private));
+    }
+    assert!(persistent.contains("[File Event] Triggering scan. Changed transcripts:"));
     assert!(persistent.contains("[LOCKOUT DETECTED] Rate limit hit from file watcher."));
 }

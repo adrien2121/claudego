@@ -31,22 +31,34 @@ struct StableScan {
 
 #[derive(Debug)]
 enum ScanFailure {
-    Open(std::io::Error),
-    Metadata(std::io::Error),
-    Mmap(std::io::Error),
+    Open,
+    Metadata,
+    Mmap,
     InvalidUtf8,
     Changed,
 }
 
-impl std::fmt::Display for ScanFailure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Open(error) => write!(formatter, "open failed: {error}"),
-            Self::Metadata(error) => write!(formatter, "metadata failed: {error}"),
-            Self::Mmap(error) => write!(formatter, "mmap failed: {error}"),
-            Self::InvalidUtf8 => formatter.write_str("new content is invalid UTF-8"),
-            Self::Changed => formatter.write_str("file changed during scan; retrying"),
-        }
+impl ScanFailure {
+    fn open(_: std::io::Error) -> Self {
+        Self::Open
+    }
+
+    fn metadata(_: std::io::Error) -> Self {
+        Self::Metadata
+    }
+
+    fn mmap(_: std::io::Error) -> Self {
+        Self::Mmap
+    }
+}
+
+fn scan_failure_diagnostic(failure: &ScanFailure) -> &'static str {
+    match failure {
+        ScanFailure::Open => "[Scan Error] Transcript open failed.",
+        ScanFailure::Metadata => "[Scan Error] Transcript metadata read failed.",
+        ScanFailure::Mmap => "[Scan Error] Transcript mapping failed.",
+        ScanFailure::InvalidUtf8 => "[Scan Error] Transcript content was not valid UTF-8.",
+        ScanFailure::Changed => "[Scan Error] Transcript changed during scan; retrying.",
     }
 }
 
@@ -58,7 +70,7 @@ fn scan_mmap_range(
 ) -> Result<Option<LimitUpdate>, ScanFailure> {
     // Safety: the file is opened read-only and the captured range is bounds-checked
     // before slicing, so concurrent truncation is reported instead of panicking.
-    let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(ScanFailure::Mmap)?;
+    let mmap = unsafe { memmap2::Mmap::map(file) }.map_err(ScanFailure::mmap)?;
     if new_size > mmap.len() as u64 {
         return Err(ScanFailure::Changed);
     }
@@ -82,18 +94,18 @@ fn scan_stable_range_with(
     parser: &dyn TranscriptParser,
     after_scan: impl FnOnce(),
 ) -> Result<StableScan, ScanFailure> {
-    let file = File::open(path).map_err(ScanFailure::Open)?;
-    let before = file.metadata().map_err(ScanFailure::Metadata)?;
+    let file = File::open(path).map_err(ScanFailure::open)?;
+    let before = file.metadata().map_err(ScanFailure::metadata)?;
     let new_size = before.len();
-    let modified = before.modified().map_err(ScanFailure::Metadata)?;
+    let modified = before.modified().map_err(ScanFailure::metadata)?;
     let update = if new_size > old_size {
         scan_mmap_range(&file, old_size, new_size, parser)?
     } else {
         None
     };
     after_scan();
-    let after = file.metadata().map_err(ScanFailure::Metadata)?;
-    if after.len() != new_size || after.modified().map_err(ScanFailure::Metadata)? != modified {
+    let after = file.metadata().map_err(ScanFailure::metadata)?;
+    if after.len() != new_size || after.modified().map_err(ScanFailure::metadata)? != modified {
         return Err(ScanFailure::Changed);
     }
     Ok(StableScan { new_size, update })
@@ -172,11 +184,9 @@ pub(super) async fn scan_and_update_state(
         }
     }
 
-    // Log which files are being scanned.
-    let path_names: Vec<_> = paths.iter().map(|p| p.display().to_string()).collect();
     log_to_file(&format!(
-        "[File Event] Triggering scan. Changed files:\n{}",
-        path_names.join("\n")
+        "[File Event] Triggering scan. Changed transcripts: {}.",
+        paths.len()
     ));
 
     for path in paths {
@@ -191,7 +201,7 @@ pub(super) async fn scan_and_update_state(
                     .get(&path)
                     .is_none_or(|last| now.duration_since(*last) >= SCAN_FAILURE_LOG_INTERVAL)
                 {
-                    log_to_file(&format!("[Scan Error] {}: {failure}", path.display()));
+                    log_to_file(scan_failure_diagnostic(&failure));
                     failure_logs.insert(path, now);
                 }
                 continue;
@@ -278,8 +288,8 @@ async fn handle_expiry_with<R: ResumeAttempt>(
     for delay in RESUME_RETRY_DELAYS {
         match outcome {
             ResumeOutcome::Sent | ResumeOutcome::AmbiguousFailure(_) => break,
-            ResumeOutcome::DefiniteFailure(ref error) => {
-                log_to_file(&format!("[Resume Error] {error}"));
+            ResumeOutcome::DefiniteFailure(_) => {
+                log_to_file("[Resume Error] Resume command failed.");
                 sleep(delay).await;
                 outcome = resume_target.resume();
             }
@@ -297,8 +307,8 @@ async fn handle_expiry_with<R: ResumeAttempt>(
             log_to_file("[System] Resuming passive file monitoring.");
         }
         ResumeOutcome::Sent => log_to_file("[System] Expiry handled, but a newer lockout has already been detected. State not cleared."),
-        ResumeOutcome::DefiniteFailure(error) | ResumeOutcome::AmbiguousFailure(error) => {
-            log_to_file(&format!("[Resume Error] {error}"));
+        ResumeOutcome::DefiniteFailure(_) | ResumeOutcome::AmbiguousFailure(_) => {
+            log_to_file("[Resume Error] Resume command failed.");
             if still_current {
                 s.resume_exhausted_revision = Some(expired_revision);
             }
@@ -310,7 +320,7 @@ async fn handle_expiry_with<R: ResumeAttempt>(
 mod tests {
     use super::{
         apply_limit_update, handle_expiry_with, record_limit_update, scan_and_update_state,
-        scan_mmap_range_for_test, scan_one_path, ScanFailure,
+        scan_failure_diagnostic, scan_mmap_range_for_test, scan_one_path, ScanFailure,
     };
     use crate::harness::{LimitState, LimitUpdate, ParseOutcome, ResumeOutcome, TranscriptParser};
     use crate::models::AppState;
@@ -375,6 +385,17 @@ mod tests {
         let result = scan_one_path(&path, &state, &PARSER);
         assert!(result.is_err());
         assert_eq!(state.lock().unwrap().file_size_cache[&path], 17);
+    }
+
+    #[test]
+    fn scan_io_diagnostic_omits_private_error_text() {
+        const PRIVATE: &str = "PRIVATE-PATH-SENTINEL";
+        let failure = ScanFailure::open(std::io::Error::other(PRIVATE));
+
+        let diagnostic = scan_failure_diagnostic(&failure);
+
+        assert_eq!(diagnostic, "[Scan Error] Transcript open failed.");
+        assert!(!diagnostic.contains(PRIVATE));
     }
 
     #[test]

@@ -28,7 +28,7 @@ const DEFERRED_GATE_DELAY: Duration = Duration::from_secs(4);
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const WATCHER_READY_LOG: &str =
     "[System] Event-driven file watcher active. Blocking until events arrive.";
-const SCAN_DEFERRED_LOG: &str = "Claude is currently streaming output. Deferring file scan";
+const SCAN_DEFERRED_LOG: &str = "Child output is currently streaming. Deferring file scan";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Scenario {
