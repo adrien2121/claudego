@@ -1,21 +1,14 @@
 $ErrorActionPreference = "Stop"
 
-$Repo = "adrien2121/claudego"
-$BinName = "claudego"
-$LogsBinName = "claudego-logs"
-
-Write-Host "Installing $BinName and $LogsBinName..."
-
-# Check if cargo is installed
-if (Get-Command cargo -ErrorAction SilentlyContinue) {
-    Write-Host "Cargo detected. Building and installing via cargo..."
-    cargo install --git "https://github.com/$Repo.git"
-    
-    Write-Host "$BinName and $LogsBinName installed successfully!"
-    Write-Host "Make sure your cargo bin directory (usually ~/.cargo/bin) is in your PATH."
-    exit 0
+if (-not (Get-Command cargo -ErrorAction SilentlyContinue)) {
+    throw "Cargo is required. Install Rust from https://rustup.rs/."
 }
 
-Write-Host "Warning: GitHub releases download logic is not yet implemented." -ForegroundColor Yellow
-Write-Host "Please install Rust (https://rustup.rs/) to compile from source, or check back later for pre-built binaries." -ForegroundColor Yellow
-exit 1
+cargo install `
+    --git https://github.com/adrien2121/botsitter `
+    --bin botsitter `
+    --bin botsitter-logs
+
+if ($LASTEXITCODE -ne 0) {
+    exit $LASTEXITCODE
+}
