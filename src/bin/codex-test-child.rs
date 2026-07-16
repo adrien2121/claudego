@@ -3,6 +3,7 @@ use serde_json::json;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::Path;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,6 +37,24 @@ fn snapshot(used_percent: f64, resets_at: serde_json::Value, sentinel: &str) -> 
     })
 }
 
+fn capture_input_for(path: &Path, duration: Duration) {
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let result = io::stdin().read_line(&mut line).map(|_| line);
+        let _ = sender.send(result);
+    });
+    match receiver.recv_timeout(duration) {
+        Ok(Ok(line)) => {
+            assert!(!line.is_empty(), "resume input reached unexpected EOF");
+            fs::write(path, line).expect("write unexpected resume capture");
+        }
+        Ok(Err(error)) => panic!("read possible resume input: {error}"),
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => panic!("resume input reader disconnected"),
+    }
+}
+
 fn main() {
     let codex_home = std::env::var_os("CODEX_HOME").expect("CODEX_HOME");
     let capture = std::env::var_os("BOTSITTER_CAPTURE").expect("BOTSITTER_CAPTURE");
@@ -46,7 +65,7 @@ fn main() {
     fs::create_dir_all(&session_dir).expect("create rollout fixture directory");
     let rollout = session_dir.join("rollout-test.jsonl");
 
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(10);
     while !Path::new(&trigger).exists() {
         assert!(Instant::now() < deadline, "test trigger timed out");
         thread::sleep(Duration::from_millis(10));
@@ -67,7 +86,7 @@ fn main() {
                 &rollout,
                 snapshot(100.0, serde_json::Value::Null, &sentinel),
             );
-            thread::sleep(Duration::from_secs(6));
+            capture_input_for(Path::new(&capture), Duration::from_secs(6));
         }
         "null" => {
             append(
@@ -82,14 +101,14 @@ fn main() {
                     }
                 }),
             );
-            thread::sleep(Duration::from_secs(6));
+            capture_input_for(Path::new(&capture), Duration::from_secs(6));
         }
         "clear-after-lock" => {
             let reset = json!(Utc::now().timestamp() + 8);
             append(&rollout, snapshot(100.0, reset.clone(), &sentinel));
             thread::sleep(Duration::from_millis(100));
             append(&rollout, snapshot(50.0, reset, &sentinel));
-            thread::sleep(Duration::from_secs(9));
+            capture_input_for(Path::new(&capture), Duration::from_secs(9));
         }
         other => panic!("unknown BOTSITTER_TEST_EVENT: {other}"),
     }

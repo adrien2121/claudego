@@ -123,6 +123,22 @@ struct CaseResult {
     output: Vec<u8>,
 }
 
+fn assert_no_resume_diagnostics(log: &str, mode: &str) {
+    for diagnostic in [
+        "[LOCKOUT ON STARTUP]",
+        "[LOCKOUT DETECTED]",
+        "[Lockout Cooldown]",
+        "[Trigger] Reset time reached.",
+        "[Resume Error]",
+        "[System] Resume command sent.",
+    ] {
+        assert!(
+            !log.contains(diagnostic),
+            "unexpected resume/expiry diagnostic {diagnostic:?} for mode {mode}; log:\n{log}"
+        );
+    }
+}
+
 fn drain_live_log(stream: &mut TcpStream, live: &mut Vec<u8>) {
     let mut chunk = [0_u8; 512];
     loop {
@@ -258,6 +274,7 @@ fn real_codex_watch_wait_and_resume_semantics() {
     for mode in ["missing-reset", "null", "clear-after-lock"] {
         let result = run_case(mode);
         assert_eq!(result.capture, None, "unexpected resume for mode {mode}");
+        assert_no_resume_diagnostics(&result.log, mode);
         assert!(
             !result
                 .output
@@ -285,7 +302,6 @@ fn real_codex_watch_wait_and_resume_semantics() {
                 assert!(result
                     .log
                     .contains("[LIMIT UPDATE] Transcript state cleared from file watcher."));
-                assert!(!result.log.contains("[System] Resume command sent."));
             }
             _ => unreachable!(),
         }
