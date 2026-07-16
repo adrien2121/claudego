@@ -1,29 +1,9 @@
 use anyhow::Result;
 use botsitter::app;
+use botsitter::cli::Cli;
 use botsitter::providers;
 use clap::Parser;
 use keepawake::Builder;
-
-/// A fire-and-forget wrapper for the claude CLI that automatically handles rate limits.
-#[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "A fire-and-forget wrapper for the claude CLI that automatically handles rate limits.",
-    author = "Adrien Adam"
-)]
-struct Cli {
-    /// Prevent the system from sleeping while botsitter is running.
-    #[arg(long, short = 'p')]
-    prevent_sleep: bool,
-
-    /// Show logs in a new terminal window.
-    #[arg(long, short = 'l')]
-    show_logs: bool,
-
-    /// Arguments to pass to the 'claude' command.
-    #[arg(last = true, name = "COMMAND")]
-    command: Vec<String>,
-}
 
 #[tokio::main]
 async fn main() -> Result<std::process::ExitCode> {
@@ -40,8 +20,16 @@ async fn main() -> Result<std::process::ExitCode> {
         None
     };
 
-    let args = cli.command.into_iter().map(Into::into).collect();
-    let outcome = app::run(cli.show_logs, providers::claude::prepare(args)?).await?;
+    let mut provider_and_args = cli.provider_and_args.into_iter();
+    let provider = provider_and_args.next().expect("clap requires provider");
+    let args = provider_and_args.collect();
+    let plan = match provider.to_str() {
+        Some("claude") => providers::claude::prepare(args)?,
+        Some("codex") => providers::codex::prepare(args)?,
+        Some(name) => anyhow::bail!("unsupported provider '{name}'; expected 'claude' or 'codex'"),
+        None => anyhow::bail!("provider name must be valid UTF-8"),
+    };
+    let outcome = app::run(cli.show_logs, plan).await?;
     drop(_awake_guard);
     Ok(std::process::ExitCode::from(outcome.wrapper_code()))
 }

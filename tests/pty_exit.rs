@@ -25,7 +25,13 @@ fn final_pty_bytes_drain_before_shutdown() {
     let tmp = std::env::temp_dir().join(format!("botsitter-pty-exit-{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("create isolated temp directory");
     let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
-    command.args(["--", "/bin/sh", "-c", "printf 'FINAL-PTY-BYTES\\n'; exit 7"]);
+    command.args([
+        "claude",
+        "--",
+        "/bin/sh",
+        "-c",
+        "printf 'FINAL-PTY-BYTES\\n'; exit 7",
+    ]);
     command.env("TMPDIR", &tmp);
     let mut child = pair.slave.spawn_command(command).expect("spawn botsitter");
     let wrapper_pid = child.process_id().expect("botsitter PID");

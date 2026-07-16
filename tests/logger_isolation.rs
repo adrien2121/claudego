@@ -81,7 +81,7 @@ fn concurrent_runs_keep_independent_logger_files() {
     };
     let first_pair = NativePtySystem::default().openpty(size).unwrap();
     let mut first_command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
-    first_command.args(["--", "/bin/sleep", "2"]);
+    first_command.args(["claude", "--", "/bin/sleep", "2"]);
     first_command.env("TMPDIR", &tmp);
     let mut first = first_pair.slave.spawn_command(first_command).unwrap();
     let first_pid = first.process_id().unwrap();
@@ -90,7 +90,7 @@ fn concurrent_runs_keep_independent_logger_files() {
 
     let second_pair = NativePtySystem::default().openpty(size).unwrap();
     let mut second_command = CommandBuilder::new(env!("CARGO_BIN_EXE_botsitter"));
-    second_command.args(["--", "/bin/sleep", "10"]);
+    second_command.args(["claude", "--", "/bin/sleep", "10"]);
     second_command.env("TMPDIR", &tmp);
     let mut second = second_pair.slave.spawn_command(second_command).unwrap();
     let second_pid = second.process_id().unwrap();

@@ -268,6 +268,7 @@ fn run_scenario(
     } else {
         let mut command = CommandBuilder::new(botsitter_exe);
         command.args([
+            "claude",
             "--",
             benchmark_exe
                 .to_str()

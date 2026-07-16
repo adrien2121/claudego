@@ -94,6 +94,7 @@ fn arbitrary_session_content_is_absent_from_live_and_persistent_logs() {
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_botsitter"))
         .args([
+            "claude",
             "--",
             "claude",
             "-p",

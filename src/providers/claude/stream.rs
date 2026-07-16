@@ -322,9 +322,9 @@ async fn restart_running_child(child: &mut tokio::process::Child) -> Result<()> 
     }
 }
 
-fn resume_command_with_program(program: &str, session_id: &str) -> CommandSpec {
+fn resume_command_with_program(program: &std::ffi::OsStr, session_id: &str) -> CommandSpec {
     let mut command = stream_resume_command(session_id);
-    command.program = program.to_string();
+    command.program = program.to_os_string();
     command
 }
 
@@ -828,8 +828,8 @@ mod tests {
         let state = Arc::new(Mutex::new(AppState::new()));
         let (resume_tx, resume_rx) = mpsc::unbounded_channel();
         let command = CommandSpec {
-            program: path.to_string_lossy().into_owned(),
-            args: vec![ready_path.to_string_lossy().into_owned()],
+            program: path.clone().into_os_string(),
+            args: vec![ready_path.clone().into_os_string()],
         };
         let task = tokio::spawn(run_stream_json_print(command, state, resume_rx));
         let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
@@ -853,18 +853,18 @@ mod tests {
     #[test]
     fn resume_command_preserves_original_program() {
         assert_eq!(
-            resume_command_with_program("/opt/bin/claude", "session-123"),
+            resume_command_with_program(std::ffi::OsStr::new("/opt/bin/claude"), "session-123"),
             CommandSpec {
-                program: "/opt/bin/claude".to_string(),
+                program: "/opt/bin/claude".into(),
                 args: vec![
-                    "--resume".to_string(),
-                    "session-123".to_string(),
-                    "-p".to_string(),
-                    "--output-format".to_string(),
-                    "stream-json".to_string(),
-                    "--verbose".to_string(),
-                    "--include-partial-messages".to_string(),
-                    "continue".to_string(),
+                    "--resume".into(),
+                    "session-123".into(),
+                    "-p".into(),
+                    "--output-format".into(),
+                    "stream-json".into(),
+                    "--verbose".into(),
+                    "--include-partial-messages".into(),
+                    "continue".into(),
                 ],
             }
         );

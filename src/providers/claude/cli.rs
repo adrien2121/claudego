@@ -1,23 +1,13 @@
 use super::stream::ClaudeStreamRunner;
-use crate::cli::CommandSpec;
+use crate::cli::{command_from_args, CommandSpec};
 use crate::harness::Runner;
 use crate::runners::pty::PtyRunner;
 use anyhow::Result;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 pub(super) fn command(args: Vec<OsString>) -> Result<CommandSpec> {
-    if args.is_empty() {
-        return Ok(CommandSpec {
-            program: "claude".to_string(),
-            args: Vec::new(),
-        });
-    }
-
-    let mut args = args.into_iter();
-    let program = utf8(args.next().expect("non-empty arguments"))?;
-    let args = args.map(utf8).collect::<Result<_>>()?;
-    Ok(CommandSpec { program, args })
+    command_from_args("claude", args)
 }
 
 pub(super) fn runner(command: CommandSpec) -> Box<dyn Runner> {
@@ -35,34 +25,28 @@ fn uses_stream_runner(command: &CommandSpec) -> bool {
 
 pub(super) fn stream_resume_command(session_id: &str) -> CommandSpec {
     CommandSpec {
-        program: "claude".to_string(),
+        program: "claude".into(),
         args: vec![
-            "--resume".to_string(),
-            session_id.to_string(),
-            "-p".to_string(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--include-partial-messages".to_string(),
-            "continue".to_string(),
+            "--resume".into(),
+            session_id.into(),
+            "-p".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--verbose".into(),
+            "--include-partial-messages".into(),
+            "continue".into(),
         ],
     }
 }
 
-fn utf8(value: OsString) -> Result<String> {
-    value
-        .into_string()
-        .map_err(|_| anyhow::anyhow!("Claude command arguments must be valid UTF-8"))
-}
-
-fn is_claude_program(program: &str) -> bool {
+fn is_claude_program(program: &OsStr) -> bool {
     Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name == "claude" || name == "claude.exe")
 }
 
-fn args_before_child_boundary(args: &[String]) -> &[String] {
+fn args_before_child_boundary(args: &[OsString]) -> &[OsString] {
     let boundary = args
         .iter()
         .position(|arg| arg == "--")
@@ -70,11 +54,11 @@ fn args_before_child_boundary(args: &[String]) -> &[String] {
     &args[..boundary]
 }
 
-fn has_print_flag(args: &[String]) -> bool {
+fn has_print_flag(args: &[OsString]) -> bool {
     args.iter().any(|arg| arg == "-p" || arg == "--print")
 }
 
-fn has_stream_json_output(args: &[String]) -> bool {
+fn has_stream_json_output(args: &[OsString]) -> bool {
     args.windows(2)
         .any(|pair| pair[0] == "--output-format" && pair[1] == "stream-json")
         || args.iter().any(|arg| arg == "--output-format=stream-json")
@@ -84,7 +68,7 @@ fn has_stream_json_output(args: &[String]) -> bool {
 mod tests {
     use super::{command, is_claude_program, stream_resume_command, uses_stream_runner};
     use crate::cli::CommandSpec;
-    use std::ffi::OsString;
+    use std::ffi::{OsStr, OsString};
 
     #[test]
     fn default_claude_uses_pty() {
@@ -101,10 +85,10 @@ mod tests {
 
     #[test]
     fn recognizes_claude_program_names() {
-        assert!(is_claude_program("claude"));
-        assert!(is_claude_program("/usr/local/bin/claude"));
-        assert!(is_claude_program("claude.exe"));
-        assert!(!is_claude_program("bash"));
+        assert!(is_claude_program(OsStr::new("claude")));
+        assert!(is_claude_program(OsStr::new("/usr/local/bin/claude")));
+        assert!(is_claude_program(OsStr::new("claude.exe")));
+        assert!(!is_claude_program(OsStr::new("bash")));
     }
 
     #[test]
@@ -185,9 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn explicit_command_is_preserved() {
+    fn child_arguments_are_preserved() {
         assert_eq!(
-            command(vec![OsString::from("claude"), OsString::from("--help")]).unwrap(),
+            command(vec![OsString::from("--help")]).unwrap(),
             CommandSpec {
                 program: "claude".into(),
                 args: vec!["--help".into()]

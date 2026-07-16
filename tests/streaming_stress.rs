@@ -140,6 +140,7 @@ fn real_binary_streaming_stress_delivers_one_watcher_lockout() {
     fs::write(&session, b"{\"type\":\"baseline\"}\n").expect("seed session log");
     let child = Command::new(env!("CARGO_BIN_EXE_botsitter"))
         .args([
+            "claude",
             "--",
             "claude",
             "-p",
