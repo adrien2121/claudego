@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 crossterm = "0.27"
 dirs = "5.0"
 tokio = { version = "1", features = ["full"] }
@@ -14,7 +14,6 @@ portable-pty = "0.8"
 regex = "1.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-lazy_static = "1.4"
 notify = "6.1.1"
 keepawake = "0.6.0"
 memchr = "2.7.2"
@@ -25,11 +24,3 @@ signal-hook = "0.4.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-
-[[bench]]
-name = "pty_hot_path"
-harness = false
-
-[[bench]]
-name = "runtime_candidates"
-harness = false

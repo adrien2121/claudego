@@ -263,7 +263,6 @@ dependencies = [
  "crossterm",
  "dirs",
  "keepawake",
- "lazy_static",
  "memchr",
  "memmap2",
  "notify",
@@ -312,7 +311,6 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
- "serde",
  "wasm-bindgen",
  "windows-link",
 ]
