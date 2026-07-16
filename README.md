@@ -1,39 +1,29 @@
 # botsitter
 
-`botsitter` wraps Claude Code and Codex CLI sessions, waits for usage limits to reset, then sends `continue`.
+`botsitter` wraps Claude Code or Codex CLI and resumes interactive sessions when usage resets.
 
 ## Requirements
 
+- [Claude Code](https://code.claude.com/docs/en/setup) or [Codex CLI](https://developers.openai.com/codex/cli/)
 - [Rust/Cargo](https://rustup.rs/)
-- [Claude Code](https://code.claude.com/docs/en/setup) and/or [Codex CLI](https://developers.openai.com/codex/cli/)
 
-Install the two product binaries:
+## Install
 
 ```sh
-cargo install --git https://github.com/adrien2121/botsitter --bin botsitter --bin botsitter-logs
+cargo install --git https://github.com/adrien2121/botsitter.git --bin botsitter --bin botsitter-logs
 ```
 
 ## Usage
-
-Choose a provider for every run:
 
 ```sh
 botsitter claude
 botsitter codex --model gpt-5.4
 botsitter --prevent-sleep claude --model opus
-```
-
-Pass a custom command after `--`:
-
-```sh
 botsitter claude -- caffeinate claude
-```
-
-Open live logs for the current run, or attach manually:
-
-```sh
-botsitter --show-logs claude
+botsitter --show-logs codex
 botsitter-logs [pid]
 ```
 
-Claude supports interactive sessions and its existing stream-JSON resume mode. Codex support is interactive-only; `codex exec` is unsupported.
+Wrapper options go before `claude` or `codex`. Arguments after the provider are forwarded literally. Put `--` after the provider to run a custom command.
+
+Claude supports interactive sessions and print mode with `--output-format stream-json`. Codex support is interactive-only; `codex exec` is not supported.
