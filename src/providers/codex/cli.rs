@@ -71,7 +71,9 @@ fn is_codex_program(program: &OsStr) -> bool {
     Path::new(program)
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "codex" || name == "codex.exe")
+        .is_some_and(|name| {
+            name.eq_ignore_ascii_case("codex") || name.eq_ignore_ascii_case("codex.exe")
+        })
 }
 
 #[cfg(test)]
@@ -207,6 +209,17 @@ mod tests {
                 args: vec!["-c".into(), "codex exec".into()],
             }
         );
+    }
+
+    #[test]
+    fn windows_codex_basename_is_ascii_case_insensitive_and_exact() {
+        assert_eq!(
+            command(vec!["--".into(), "CODEX.EXE".into(), "exec".into()])
+                .unwrap_err()
+                .to_string(),
+            INTERACTIVE_ONLY
+        );
+        assert!(command(vec!["--".into(), "my-CODEX.EXE".into(), "exec".into(),]).is_ok());
     }
 
     #[test]
